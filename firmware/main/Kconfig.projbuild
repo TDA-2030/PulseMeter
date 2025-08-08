@@ -1,0 +1,115 @@
+menu "Example Configuration"
+
+    orsource "$IDF_PATH/examples/common_components/env_caps/$IDF_TARGET/Kconfig.env_caps"
+
+    menu "NMEA Statement Support"
+        comment "At least one statement must be selected"
+        config NMEA_STATEMENT_GGA
+            bool "GGA Statement"
+            default y
+            help
+                Enabling this option will parse the following parameter from GGA statement:
+
+                - Latitude, Longitude, Altitude;
+                - Number of satellites in use, fix status (no fix, GPS, DGPS), UTC time;
+
+        config NMEA_STATEMENT_GSA
+            bool "GSA Statement"
+            default y
+            help
+                Enabling this option will parse the following parameter from GSA statement:
+
+                - Position/Vertical/Horizontal dilution of precision;
+                - Fix mode (no fix, 2D, 3D fix);
+                - IDs of satellites in use;
+
+        config NMEA_STATEMENT_GSV
+            bool "GSV Statement"
+            default y
+            help
+                Enabling this option will parse the following parameter from GSV statement:
+
+                - Number of satellites in view;
+                - Optional details of each satellite in view;
+
+        config NMEA_STATEMENT_RMC
+            bool "RMC Statement"
+            default y
+            help
+                Enabling this option will parse the following parameter from RMC statement:
+
+                - Validity of GPS signal;
+                - Ground speed (knots) and course over ground (degrees);
+                - Magnetic variation;
+                - UTC date;
+
+        config NMEA_STATEMENT_GLL
+            bool "GLL Statement"
+            default y
+            help
+                Enabling this option will parse the following parameter from GLL statement:
+
+                - Latitude, Longitude;
+                - UTC time;
+
+        config NMEA_STATEMENT_VTG
+            bool "VTG Statement"
+            default y
+            help
+                Enabling this option will parse the following parameter from VTG statement:
+
+                - Ground speed (knots, km/h) and course over ground (degrees);
+                - Magnetic variation;
+
+    endmenu
+
+    config EXAMPLE_MDNS_HOST_NAME
+        string "mDNS Host Name"
+        default "esp-home"
+        help
+            Specify the domain name used in the mDNS service.
+            Note that webpage also take it as a part of URL where it will send GET/POST requests to.
+
+    choice EXAMPLE_WEB_DEPLOY_MODE
+        prompt "Website deploy mode"
+        default EXAMPLE_WEB_DEPLOY_SF
+        help
+            Select website deploy mode.
+            You can deploy website to host, and ESP32 will retrieve them in a semihost way (JTAG is needed).
+            You can deploy website to SD card or SPI flash, and ESP32 will retrieve them via SDIO/SPI interface.
+            Detailed operation steps are listed in the example README file.
+        config EXAMPLE_WEB_DEPLOY_SEMIHOST
+            bool "Deploy website to host (JTAG is needed)"
+            help
+                Deploy website to host.
+                It is recommended to choose this mode during developing.
+        config EXAMPLE_WEB_DEPLOY_SD
+            depends on IDF_TARGET_ESP32
+            bool "Deploy website to SD card"
+            help
+                Deploy website to SD card.
+                Choose this production mode if the size of website is too large (bigger than 2MB).
+        config EXAMPLE_WEB_DEPLOY_SF
+            bool "Deploy website to SPI Nor Flash"
+            help
+                Deploy website to SPI Nor Flash.
+                Choose this production mode if the size of website is small (less than 2MB).
+    endchoice
+
+    if EXAMPLE_WEB_DEPLOY_SEMIHOST
+        config EXAMPLE_HOST_PATH_TO_MOUNT
+            string "Host path to mount (e.g. absolute path to web dist directory)"
+            default "PATH-TO-WEB-DIST_DIR"
+            help
+                When using semihost in ESP32, you should specify the host path which will be mounted to VFS.
+                Note that only absolute path is acceptable.
+    endif
+
+    config EXAMPLE_WEB_MOUNT_POINT
+        string "Website mount point in VFS"
+        default "/www"
+        help
+            Specify the mount point in VFS.
+
+
+endmenu

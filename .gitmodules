@@ -1,0 +1,6 @@
+[submodule "hardware/Libraries/useful-kicad-lib"]
+	path = hardware/Libraries/useful-kicad-lib
+	url = https://github.com/TDA-2030/useful-kicad-lib.git
+[submodule "hardware/Libraries/kicad-libraries"]
+	path = hardware/Libraries/kicad-libraries
+	url = https://github.com/TDA-2030/kicad-libraries.git
