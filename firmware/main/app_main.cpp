@@ -47,6 +47,9 @@ extern "C" void app_main()
     meters[0].init(BOARD_IO_METER1);
     meters[1].init(BOARD_IO_METER2);
 
+    meters[0].set_max_duty(448);
+    meters[1].set_max_duty(236);
+
     meters[0].waitSelfTestDone();
     meters[1].waitSelfTestDone();
 
