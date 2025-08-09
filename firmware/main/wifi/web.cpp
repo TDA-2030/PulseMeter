@@ -28,11 +28,13 @@
 #include "driver/sdmmc_host.h"
 #endif
 #include "rest_server.h"
+#include "meter_dial.h"
 
 #define MDNS_INSTANCE "esp home web server"
 
 static const char *TAG = "web";
 
+extern MeterDial meters[];
 
 static void initialise_mdns(void)
 {
@@ -213,7 +215,9 @@ static void event_handler(void *arg, esp_event_base_t event_base,
 
 void start_web(void)
 {
-   bool is_configured;
+    meters[0].set_percent(50);
+    meters[1].set_percent(50);
+    bool is_configured;
     ESP_LOGI(TAG, "Setup Wifi ...");
     wifiIinitialize("时钟", "", &is_configured);
     ESP_ERROR_CHECK(esp_event_handler_register(APP_NETWORK_EVENT, ESP_EVENT_ANY_ID, &event_handler, NULL));
@@ -225,10 +229,14 @@ void start_web(void)
         sprintf(str, "正在连接%s", wifi_config.sta.ssid);
         ESP_LOGI(TAG, "SSID:%s, PASSWORD:%s", wifi_config.sta.ssid, wifi_config.sta.password);
     } else {
+        meters[0].set_percent(95);
+        meters[1].set_percent(95);
         captive_portal_start();
     }
     xEventGroupWaitBits(g_wifi_event_group, WIFI_STA_GOT_IP, 0, 0, portMAX_DELAY);
 
+    meters[0].set_percent(0);
+    meters[1].set_percent(0);
     // ESP_ERROR_CHECK(example_connect());
     ESP_ERROR_CHECK(init_fs());
     WebServer *webServer = new WebServer(CONFIG_EXAMPLE_WEB_MOUNT_POINT);

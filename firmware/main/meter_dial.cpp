@@ -22,20 +22,17 @@
 
 static const char *TAG = "motor";
 
+int PWM::channel_cnt = (int) LEDC_CHANNEL_0;
 
-/* Warning:
- * For ESP32, ESP32S2, ESP32S3, ESP32C3, ESP32C2, ESP32C6, ESP32H2, ESP32P4 targets,
- * when LEDC_DUTY_RES selects the maximum duty resolution (i.e. value equal to SOC_LEDC_TIMER_BIT_WIDTH),
- * 100% duty cycle is not reachable (duty cannot be set to (2 ** SOC_LEDC_TIMER_BIT_WIDTH)).
- */
 bool PWM::init(int pin1)
 {
 #define LEDC_TIMER              LEDC_TIMER_0
 #define LEDC_MODE               LEDC_LOW_SPEED_MODE
 #define LEDC_DUTY_RES           LEDC_TIMER_12_BIT
 
+    ESP_LOGI(TAG, "Initializing PWM channel %d on pin %d", channel_cnt, pin1);
+    channel = channel_cnt++;
 
-    ESP_LOGI(TAG, "Initializing PWM...");
     // Prepare and then apply the LEDC PWM timer configuration
     ledc_timer_config_t ledc_timer = {
         .speed_mode       = LEDC_MODE,
@@ -49,9 +46,9 @@ bool PWM::init(int pin1)
 
     // Prepare and then apply the LEDC PWM channel configuration
     ledc_channel_config_t ledc_channel = {
-        .gpio_num       = 0,
+        .gpio_num       = pin1,
         .speed_mode     = LEDC_MODE,
-        .channel        = LEDC_CHANNEL_0,
+        .channel        = (ledc_channel_t)channel,
         .intr_type      = LEDC_INTR_DISABLE,
         .timer_sel      = LEDC_TIMER,
         .duty           = 0, // Set duty to 0%
@@ -61,24 +58,19 @@ bool PWM::init(int pin1)
             .output_invert = 0,
         },
     };
-
-    int channel = LEDC_CHANNEL_0;
-
-    ledc_channel.channel = (ledc_channel_t)channel;
-    ledc_channel.gpio_num = pin1;
     ESP_ERROR_CHECK(ledc_channel_config(&ledc_channel));
     return 0;
 }
 
 void PWM::set_pwm(uint32_t duty)
 {
-    ledc_set_duty(LEDC_MODE, LEDC_CHANNEL_0, duty);
-    ESP_ERROR_CHECK(ledc_update_duty(LEDC_MODE, LEDC_CHANNEL_0));
+    ledc_set_duty(LEDC_MODE, (ledc_channel_t)channel, duty);
+    ESP_ERROR_CHECK(ledc_update_duty(LEDC_MODE, (ledc_channel_t)channel));
 }
 
 MeterDial::MeterDial(const char *_name): name(_name)
 {
-    
+
 }
 
 void MeterDial::init(int pwm_pin)
@@ -87,6 +79,7 @@ void MeterDial::init(int pwm_pin)
     pwm->init(pwm_pin);
     pwm->set_pwm(0);
     max_duty = 450;
+    selfTest();
 }
 
 void MeterDial::set_percent(int percent)
@@ -100,4 +93,67 @@ void MeterDial::enable(bool is_enable)
 {
 
 
+}
+
+void MeterDial::selfTestTimerCallback(TimerHandle_t xTimer)
+{
+    auto *meter = static_cast<MeterDial *>(pvTimerGetTimerID(xTimer));
+    MeterDial::selfTest_ctx_s *st = &meter->selfTestCtx;
+
+    const float accelUp     = 0.2f;  // 上升加速度
+    const float accelDown   = 0.2f; // 下降加速度（减速）
+
+    if (st->state == MeterDial::selfTest_ctx_s::ACCEL_UP) {
+        // 加速度增加速度
+        st->velocity += accelUp;
+        st->currentValue += st->velocity;
+
+        if (st->currentValue >= 100) {
+            st->currentValue = 100;
+            st->velocity *= -1; // 到顶速度反转
+            st->state = MeterDial::selfTest_ctx_s::SLOW_DOWN;
+        }
+        meter->set_percent(st->currentValue);
+
+    } else if (st->state == MeterDial::selfTest_ctx_s::SLOW_DOWN) {
+        // 缓慢下降
+        st->velocity += accelDown;
+        st->currentValue += st->velocity;
+
+        if (st->currentValue <= 8) {
+            st->currentValue = 0;
+            st->velocity = 0;
+            st->state = MeterDial::selfTest_ctx_s::IDLE;
+            xTimerStop(st->Timer, 0);
+            xTimerDelete(st->Timer, 0);
+            st->Timer = nullptr;
+        }
+        meter->set_percent(st->currentValue);
+    }
+}
+
+void MeterDial::selfTest()
+{
+    if (selfTestCtx.Timer != nullptr) {
+        xTimerStop(selfTestCtx.Timer, 0);
+        xTimerDelete(selfTestCtx.Timer, 0);
+    }
+    // 创建周期 20ms 的定时器
+    selfTestCtx.Timer = xTimerCreate(
+                        "SelfTestTimer",
+                        pdMS_TO_TICKS(30),
+                        pdTRUE,
+                        this,
+                        &MeterDial::selfTestTimerCallback
+                    );
+    selfTestCtx.state = MeterDial::selfTest_ctx_s::ACCEL_UP;
+    selfTestCtx.currentValue = 0;
+    xTimerStart(selfTestCtx.Timer, 0);
+}
+
+void MeterDial::waitSelfTestDone()
+{
+    while (selfTestCtx.state != MeterDial::selfTest_ctx_s::IDLE) {
+        vTaskDelay(pdMS_TO_TICKS(30));
+    }
 }

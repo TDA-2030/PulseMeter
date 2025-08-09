@@ -1,6 +1,15 @@
+#include <string.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "esp_timer.h"
+
+#include "esp_log.h"
 #include "cpu_load.h"
+#include "meter_dial.h"
 
 static const char *TAG = "CpuLoad";
+
+extern MeterDial meters[];
 
 CpuLoad::CpuLoad()
     : port_(5000), listen_fd(-1), client_fd(-1)
@@ -30,11 +39,45 @@ bool CpuLoad::startServer() {
         return false;
     }
 
-    ESP_LOGI(TAG, "TCP 服务器启动，等待客户端连接...");
+    ESP_LOGI(TAG, "TCP 服务器启动");
+
+    xTaskCreate(
+        [](void *param) {
+            CpuLoad *server = static_cast<CpuLoad*>(param);
+            static int last_time = 0;
+
+            while (true) {
+                // 等待客户端连接
+                server->waitForClient();
+
+                while (true) {
+                    CpuLoad::Data v;
+                    bool res = server->readCpuLoad(v);
+                    if (!res) {
+                        // 客户端断开，重新等待
+                        break;
+                    }
+
+                    int ct = esp_timer_get_time() / 1000; // 毫秒
+                    ESP_LOGI(TAG, "(%dms), data: [%d, %d]", ct - last_time, v.d1, v.d2);
+                    last_time = ct;
+
+                    meters[0].set_percent(v.d1);
+                    meters[1].set_percent(v.d2);
+                }
+            }
+        },
+        "server_task",  // 任务名称
+        4096,             // 栈大小
+        this,          // 参数
+        5,                // 优先级
+        nullptr           // 任务句柄
+    );
     return true;
 }
 
 bool CpuLoad::waitForClient() {
+    ESP_LOGI(TAG, "等待客户端连接");
     struct sockaddr_in client_addr;
     socklen_t addr_len = sizeof(client_addr);
     client_fd = accept(listen_fd, (struct sockaddr*)&client_addr, &addr_len);
@@ -42,13 +85,16 @@ bool CpuLoad::waitForClient() {
         ESP_LOGE(TAG, "接受客户端失败");
         return false;
     }
+    // 关闭 Nagle 算法
+    int flag = 1;
+    setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(int));
     ESP_LOGI(TAG, "客户端已连接");
     return true;
 }
 
-bool CpuLoad::readCpuLoad(uint8_t &cpu_load) {
-    uint8_t header[3];
-    int ret = recv(client_fd, header, 3, MSG_WAITALL);
+bool CpuLoad::readCpuLoad(Data &_data) {
+    uint8_t buffer[8];
+    int ret = recv(client_fd, buffer, 5, MSG_WAITALL);
     if (ret == 0) { // 对方关闭连接
         ESP_LOGW(TAG, "客户端已断开");
         close(client_fd);
@@ -63,20 +109,18 @@ bool CpuLoad::readCpuLoad(uint8_t &cpu_load) {
         }
         return false;
     }
-    if (header[0] != 0x23 || header[1] != 0x35) {
+    if (buffer[0] != 0x23 || buffer[1] != 0x35) {
         ESP_LOGW(TAG, "包头错误");
-        return false;
+        return true;
     }
 
-    uint8_t len = header[2];
-    uint8_t data[256];
-    ret = recv(client_fd, data, len, MSG_WAITALL);
-    if (ret != len) {
-        ESP_LOGW(TAG, "数据长度错误");
-        return false;
+    if (buffer[2] != 2) {
+        ESP_LOGW(TAG, "长度错误");
+        return true;
     }
 
-    cpu_load = data[0];
+    _data.d1 = buffer[3];
+    _data.d2 = buffer[4];
     return true;
 }
 

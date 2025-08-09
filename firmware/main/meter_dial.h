@@ -21,7 +21,8 @@ public:
     // 设置PWM占空比
     void set_pwm(uint32_t duty);
 private:
-    int mot_id;
+    int channel;
+    static int channel_cnt; 
 };
 
 
@@ -34,7 +35,8 @@ public:
     MeterDial &operator=(const MeterDial &) = delete;
 
     void init(int pwm_pin);
-
+    void selfTest();
+    void waitSelfTestDone();
     void enable(bool is_enable);
     void set_percent(int percent);
 
@@ -47,18 +49,27 @@ public:
     {
         return 0;
     }
-    
+
     void set_max_duty(uint32_t max_duty)
     {
         this->max_duty = max_duty;
     }
-    
+
 
 private:
     const char *name;
     PWM *pwm;
     uint32_t max_duty;
 
+    struct selfTest_ctx_s{
+        enum SelfTestState { IDLE, ACCEL_UP, SLOW_DOWN };
+        TimerHandle_t Timer;
+        int currentValue;
+        SelfTestState state;
+        float velocity;
+    };
+    static void selfTestTimerCallback(TimerHandle_t xTimer);
+    selfTest_ctx_s selfTestCtx;
 };
 
 #ifdef __cplusplus

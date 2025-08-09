@@ -20,6 +20,8 @@ MeterDial meters[] = {
     MeterDial("Meter2"),
 };
 
+CpuLoad server;
+
 extern "C" void app_main()
 {
     /* Initialize NVS. */
@@ -45,24 +47,9 @@ extern "C" void app_main()
     meters[0].init(BOARD_IO_METER1);
     meters[1].init(BOARD_IO_METER2);
 
-    start_web();
+    meters[0].waitSelfTestDone();
+    meters[1].waitSelfTestDone();
 
-    CpuLoad server;
+    start_web();
     server.startServer();
-    
-    while (1)
-    {
-        server.waitForClient();
-        while (1)
-        {
-            uint8_t v;
-            bool res = server.readCpuLoad(v);
-            if (!res) {
-                break;
-            }
-            printf("CPU load: %d%%\n", v);
-            meters[0].set_percent(v);
-            vTaskDelay(pdMS_TO_TICKS(500));
-        }
-    }
 }

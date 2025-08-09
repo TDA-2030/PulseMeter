@@ -11,8 +11,15 @@ public:
 
     bool startServer();
     bool waitForClient();
-    bool readCpuLoad(uint8_t &cpu_load);
     bool isClientConnected();
+
+    struct Data
+    {
+        uint8_t d1;
+        uint8_t d2;
+    };
+    
+    bool readCpuLoad(Data &_data);
 
 private:
     uint16_t port_;
