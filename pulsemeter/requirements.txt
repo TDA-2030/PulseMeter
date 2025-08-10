@@ -1,0 +1,7 @@
+pyinstaller
+pillow
+psutil
+sounddevice
+numpy
+pystray
+pyyaml
