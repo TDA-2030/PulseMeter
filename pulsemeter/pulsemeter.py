@@ -1,29 +1,23 @@
 import tkinter as tk
 from tkinter import ttk
-import yaml
 import time
 import os
 import threading
 import socket
 import struct
 import psutil
-import sounddevice as sd
+import numpy as np
+import soundcard as sc
 import sys
 import traceback
 import pystray
 from PIL import Image
 from pathlib import Path
+from settings import Setting
 
 ROOT = Path(os.path.abspath(__file__)).parent
 print(ROOT)
-CONFIG_FILE = "_config.yaml"
-DEFAULT_CONFIG = {
-    "server_ip": "192.168.124.7",
-    "meter1": "CPU",
-    "meter2": "CPU",
-    "net_dev": "eth0",
-    "interval": 1.0,
-}
+
 
 # -------------------- 数据发送类 --------------------
 class DataSender:
@@ -66,72 +60,133 @@ class DataSender:
         self.sock = None
 
 
+class DataCollector:
+    def __init__(self):
+        """
+        :param interval: 数据采集间隔（秒）
+        :param metrics: 要采集的指标列表，
+                        可选 ['cpu', 'memory', 'disk_io', 'net', 'audio']
+        :param callback: 数据采集完成回调函数，函数参数为采集的数据字典
+        """
+        self.interval = None
+        self.metrics: list[str] = []
+        self.callback = None
+        self._stop_event = threading.Event()
+        self._thread = None
+        self._prev_net = psutil.net_io_counters()
+        self._prev_disk = psutil.disk_io_counters()
+        self._mic = sc.get_microphone(id=str(sc.default_speaker().name), include_loopback=True)
+
+    def get_available_metrics(self):
+        return ["cpu", "memory", "disk_io_read", "disk_io_write", "net_up", "net_down", "audio"]
+
+    def start(self, interval=1.0, metrics=None, callback=None):
+        self.interval = interval
+        self.metrics = metrics
+        self.callback = callback
+        """启动采集线程"""
+        if self._thread is None or not self._thread.is_alive():
+            self._stop_event.clear()
+            self._thread = threading.Thread(target=self._run, daemon=True)
+            self._thread.start()
+
+    def stop(self):
+        """停止采集线程"""
+        self._stop_event.set()
+        if self._thread:
+            self._thread.join()
+
+    def _get_audio_level(self, duration, samplerate=8000):
+        """
+        在整个 duration 内采样系统音频，计算 RMS 电平
+        返回值范围 0~1
+        """
+        try:
+            numframes = int(duration * samplerate)
+            with self._mic.recorder(samplerate=samplerate, channels=1) as rec:
+                data = rec.record(numframes=numframes)
+                if data.size == 0:
+                    return 0.0
+                rms = np.sqrt(np.mean(np.square(data)))
+                return round(min(rms, 1.0), 2)  # 限制最大值为1.0
+        except Exception:
+            traceback.print_exc()
+            return None  # 没有音频设备时返回 None
+
+    def _run(self):
+        while not self._stop_event.is_set():
+            start_time = time.time()
+            data = {}
+
+            # 常规指标
+            if "cpu" in self.metrics:
+                data["cpu"] = psutil.cpu_percent(interval=None)
+            if "memory" in self.metrics:
+                mem = psutil.virtual_memory()
+                data["memory"] = mem.percent
+            if "disk_io_read" in self.metrics or "disk_io_write" in self.metrics:
+                disk = psutil.disk_io_counters()
+                read_speed = (disk.read_bytes - self._prev_disk.read_bytes) / self.interval
+                write_speed = (disk.write_bytes - self._prev_disk.write_bytes) / self.interval
+                key = "disk_io_read" if "disk_io_read" in self.metrics else "disk_io_write"
+                data[key] = {"MB/s": round((read_speed if key == "disk_io_read" else write_speed) / (1024 * 1024), 2)}
+                self._prev_disk = disk
+            if "net_up" in self.metrics or "net_down" in self.metrics:
+                net = psutil.net_io_counters()
+                up_speed = (net.bytes_sent - self._prev_net.bytes_sent) / self.interval
+                down_speed = (net.bytes_recv - self._prev_net.bytes_recv) / self.interval
+                key = "net_up" if "net_up" in self.metrics else "net_down"
+                data[key] = {"MB/s": round((up_speed if key == "net_up" else down_speed) / (1024 * 1024), 2)}
+                self._prev_net = net
+            if "audio" in self.metrics:
+                # 在 interval 内采样音频
+                data["audio"] = self._get_audio_level(self.interval, samplerate=8000)
+
+            print("start")
+            # 回调输出
+            if self.callback:
+                self.callback(data)
+            print("end")
+            # 确保周期稳定
+            elapsed = time.time() - start_time
+            if elapsed < self.interval:
+                print(f"[CPU] Sleeping for {self.interval - elapsed:.2f} seconds")
+                time.sleep(self.interval - elapsed)
+
+
 # -------------------- 仪表管理类 --------------------
 class MeterManager:
     def __init__(self):
-        self.running_event = threading.Event()
-        self.last_network_recv = 0
-        self.last_network_sent = 0
         self.sender = DataSender()
-        self.thread = None
+        self.setting = Setting()
+        self.collector = DataCollector()
         self.extra_display_callback = None
+        self.is_running = False
 
-        self.data_sources = {"CPU" : self._get_cpu_percent, 
-                             "网络上传速率": self._get_network_speed,
-                             "网络下载速率": self._get_network_speed}
+    def data_cb(self, data):
+        try:
+            data1 = data[self.collector.metrics[0]]
+            data2 = data[self.collector.metrics[1]]
+            print(f"[CPU] Sending data: {data1}, {data2}")
+            # self.sender.send_data(int(data1), int(data2))
+            # if self.extra_display_callback:
+            #     self.extra_display_callback(data1, data2)
+        except Exception as e:
+            print(f"[CPU] Loop error: {e}")
+            traceback.print_exc()
 
-    def _get_cpu_percent(self):
-        return psutil.cpu_percent()
-
-    def _get_network_speed(self, interface: str, interval: float = 1.0):
-        counters = psutil.net_io_counters(pernic=True)
-        if interface not in counters:
-            return 0, 0
-        sent = counters[interface].bytes_sent
-        recv = counters[interface].bytes_recv
-        if self.last_network_recv == 0:
-            self.last_network_recv = recv
-            self.last_network_sent = sent
-        upload_speed = (sent - self.last_network_sent) / interval / 1024 * 8
-        download_speed = (recv - self.last_network_recv) / interval / 1024 * 8
-        self.last_network_recv = recv
-        self.last_network_sent = sent
-        return download_speed
-
-    def _loop(self, interval, source1, source2):
-        while self.running_event.is_set():
-            try:
-                print(f"[CPU] Looping with interval {interval}, source1 {source1}, source2 {source2}")
-                time.sleep(float(interval))
-                data1 = self.data_sources[source1]()
-                if source1 != source2:
-                    self.data_sources[source2]()
-                else:
-                    data2 = data1
-                print(f"[CPU] Sending data: {data1}, {data2}")
-                if not self.sender.send_data(int(data1), int(data2)):
-                    break
-                if self.extra_display_callback:
-                    self.extra_display_callback(data1, data2)
-            except Exception as e:
-                print(f"[CPU] Loop error: {e}")
-                traceback.print_exc()
-                break
-        self.running_event.clear()
-
-    def start(self, server_ip, interval, meter1, meter2, **kwargs):
-        if not self.running_event.is_set():
-            self.sender.connect(server_ip, 5000)
-            self.running_event.set()
-            self.thread = threading.Thread(target=self._loop, args=(interval, meter1, meter2), daemon=True).start()
+    def start(self, **kwargs):
+        print("[APP] Starting MeterManager", self.setting.systemsetting.__dict__)
+        self.collector.start(self.setting.systemsetting.interval, metrics=[self.setting.systemsetting.meter1, self.setting.systemsetting.meter2], callback=self.data_cb)
+        # self.sender.connect(self.setting.systemsetting.server_ip, 5000)
+        self.is_running = True
 
     def stop(self):
-        self.running_event.clear()
-        if self.thread:
-            self.thread.join()
-            self.sender.send_data(0, 0)
-            self.sender.close()
-            self.thread = None
+        print("[APP] Stopped MeterManager")
+        self.collector.stop()
+        # self.sender.send_data(0, 0)
+        # self.sender.close()
+        self.is_running = False
 
     def set_extra_display_callback(self, callback):
         self.extra_display_callback = callback
@@ -146,17 +201,15 @@ class PulseMeterApp:
         self.root.resizable(False, False)
         self.manager = MeterManager()
 
-        self.config = self.load_config()
-
         # 设置风格和字体
         style = ttk.Style()
-        style.theme_use('clam')  # 选择更现代的主题
+        style.theme_use("clam")  # 选择更现代的主题
         default_font = ("Segoe UI", 11)
-        style.configure('.', font=default_font)
-        style.configure('TLabel', padding=6)
-        style.configure('TButton', padding=6)
-        style.configure('TCombobox', padding=4)
-        style.configure('TSpinbox', padding=4)
+        style.configure(".", font=default_font)
+        style.configure("TLabel", padding=6)
+        style.configure("TButton", padding=6)
+        style.configure("TCombobox", padding=4)
+        style.configure("TSpinbox", padding=4)
 
         # 用grid布局上下分栏，上栏左右分栏
         top_frame = ttk.Frame(root, padding=10)
@@ -177,15 +230,14 @@ class PulseMeterApp:
 
         # 下拉框宽度统一
         combo_width = 18
-        self.combo1 = ttk.Combobox(left_frame, values=list(self.manager.data_sources.keys()), width=combo_width, state="readonly")
-        self.combo1.set(self.config.get("meter1", "CPU"))
+        self.combo1 = ttk.Combobox(left_frame, values=list(self.manager.collector.get_available_metrics()), width=combo_width, state="readonly")
+        self.combo1.set(self.manager.setting.systemsetting.meter1)
         self.combo1.grid(row=0, column=0, pady=5)
         self.meter_lebel1 = ttk.Label(left_frame, text="0")
         self.meter_lebel1.grid(row=1, column=0, sticky="e")
 
-
-        self.combo2 = ttk.Combobox(right_frame, values=list(self.manager.data_sources.keys()), width=combo_width, state="readonly")
-        self.combo2.set(self.config.get("meter2", "CPU"))
+        self.combo2 = ttk.Combobox(right_frame, values=list(self.manager.collector.get_available_metrics()), width=combo_width, state="readonly")
+        self.combo2.set(self.manager.setting.systemsetting.meter2)
         self.combo2.grid(row=0, column=0, pady=5)
         self.meter_lebel2 = ttk.Label(right_frame, text="0")
         self.meter_lebel2.grid(row=1, column=0, sticky="e")
@@ -193,12 +245,12 @@ class PulseMeterApp:
         # 下栏，使用grid分布4列，间距合理
         ttk.Label(bottom_frame, text="服务器 IP:").grid(row=0, column=0, sticky="w", padx=(0, 5))
         self.ip_entry = ttk.Entry(bottom_frame, width=18)
-        self.ip_entry.insert(0, self.config.get("server_ip", "127.0.0.1"))
+        self.ip_entry.insert(0, self.manager.setting.systemsetting.server_ip)
         self.ip_entry.grid(row=0, column=1, sticky="ew", padx=(0, 15))
 
         ttk.Label(bottom_frame, text="采样间隔(s):").grid(row=1, column=0, sticky="w", padx=(0, 5))
         self.value_spin = ttk.Spinbox(bottom_frame, from_=0.02, to=3, increment=0.1, width=8)
-        self.value_spin.set(self.config.get("interval", 1))
+        self.value_spin.set(self.manager.setting.systemsetting.interval)
         self.value_spin.grid(row=1, column=1, sticky="ew", padx=(0, 15))
 
         self.start_button = ttk.Button(bottom_frame, text="启动", command=self.toggle_start)
@@ -215,49 +267,32 @@ class PulseMeterApp:
         self.meter_lebel2.config(text=str(meter2))
 
     def toggle_start(self):
-        if self.manager.running_event.is_set():
+        if self.manager.is_running:
             self.manager.stop()
             self.start_button.config(text="启动")
             print("[APP] 停止运行")
         else:
-            self.save_config()
-            self.manager.start(
-                server_ip=self.ip_entry.get(),
-                interval=float(self.value_spin.get()),
-                meter1=self.combo1.get(),
-                meter2=self.combo2.get()
-            )
+            self.manager.setting.systemsetting.server_ip = self.ip_entry.get()
+            self.manager.setting.systemsetting.interval = float(self.value_spin.get())
+            self.manager.setting.systemsetting.meter1 = self.combo1.get()
+            self.manager.setting.systemsetting.meter2 = self.combo2.get()
+            self.manager.setting.save(self.manager.setting.save_filename)
+            self.manager.start()
             self.manager.set_extra_display_callback(self.update_meter_label)
             self.start_button.config(text="停止")
             print("[APP] 开始运行")
 
-    @staticmethod
-    def load_config():
-        if os.path.exists(CONFIG_FILE):
-            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                return yaml.safe_load(f) or DEFAULT_CONFIG.copy()
-        else:
-            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-                yaml.safe_dump(DEFAULT_CONFIG, f, allow_unicode=True)
-            return DEFAULT_CONFIG.copy()
-
-    def save_config(self):
-        self.config["server_ip"] = self.ip_entry.get()
-        self.config["meter1"] = self.combo1.get()
-        self.config["meter2"] = self.combo2.get()
-        self.config["interval"] = float(self.value_spin.get())
-        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-            yaml.safe_dump(self.config, f, allow_unicode=True)
-
 
 class TrayApp:
     def __init__(self, root, app):
-        self.root:tk.Tk = root
-        self.app:PulseMeterApp = app
-        self.icon = pystray.Icon("PulseMeter", Image.open(ROOT/"icon.png"), "PulseMeter", menu=pystray.Menu(
-            pystray.MenuItem('显示主界面', self.show_window, default=True),
-            pystray.MenuItem('退出', self.exit_app)
-        ))
+        self.root: tk.Tk = root
+        self.app: PulseMeterApp = app
+        self.icon = pystray.Icon(
+            "PulseMeter",
+            Image.open(ROOT / "icon.png"),
+            "PulseMeter",
+            menu=pystray.Menu(pystray.MenuItem("显示主界面", self.show_window, default=True), pystray.MenuItem("退出", self.exit_app)),
+        )
 
     def run(self):
         # 启动托盘图标线程
@@ -280,9 +315,8 @@ class TrayApp:
 
 if __name__ == "__main__":
     if "--no-gui" in sys.argv:
-        cfg = PulseMeterApp.load_config()
         manager = MeterManager()
-        manager.start(**cfg)
+        manager.start()
         while True:
             time.sleep(1)
     else:
