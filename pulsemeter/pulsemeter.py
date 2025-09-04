@@ -33,6 +33,7 @@ class DataSender:
             print(f"[TCP] Connecting to {host}:{port}")
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            self.sock.settimeout(2)
             self.sock.connect((host, port))
             return True
         except Exception as e:
@@ -108,7 +109,7 @@ class DataCollector:
                 if data.size == 0:
                     return 0.0
                 rms = np.sqrt(np.mean(np.square(data)))
-                return round(min(rms, 1.0), 2)  # 限制最大值为1.0
+                return round(100*min(rms, 1.0), 2)  # 限制最大值为1.0
         except Exception:
             traceback.print_exc()
             return None  # 没有音频设备时返回 None
@@ -142,11 +143,9 @@ class DataCollector:
                 # 在 interval 内采样音频
                 data["audio"] = self._get_audio_level(self.interval, samplerate=8000)
 
-            print("start")
             # 回调输出
             if self.callback:
                 self.callback(data)
-            print("end")
             # 确保周期稳定
             elapsed = time.time() - start_time
             if elapsed < self.interval:
@@ -168,9 +167,9 @@ class MeterManager:
             data1 = data[self.collector.metrics[0]]
             data2 = data[self.collector.metrics[1]]
             print(f"[CPU] Sending data: {data1}, {data2}")
-            # self.sender.send_data(int(data1), int(data2))
-            # if self.extra_display_callback:
-            #     self.extra_display_callback(data1, data2)
+            self.sender.send_data(int(data1), int(data2))
+            if self.extra_display_callback:
+                self.extra_display_callback(data1, data2)
         except Exception as e:
             print(f"[CPU] Loop error: {e}")
             traceback.print_exc()
@@ -178,14 +177,14 @@ class MeterManager:
     def start(self, **kwargs):
         print("[APP] Starting MeterManager", self.setting.systemsetting.__dict__)
         self.collector.start(self.setting.systemsetting.interval, metrics=[self.setting.systemsetting.meter1, self.setting.systemsetting.meter2], callback=self.data_cb)
-        # self.sender.connect(self.setting.systemsetting.server_ip, 5000)
+        self.sender.connect(self.setting.systemsetting.server_ip, 5000)
         self.is_running = True
 
     def stop(self):
         print("[APP] Stopped MeterManager")
         self.collector.stop()
-        # self.sender.send_data(0, 0)
-        # self.sender.close()
+        self.sender.send_data(0, 0)
+        self.sender.close()
         self.is_running = False
 
     def set_extra_display_callback(self, callback):
@@ -263,8 +262,9 @@ class PulseMeterApp:
         root.configure(bg="#f0f0f0")
 
     def update_meter_label(self, meter1, meter2):
-        self.meter_lebel1.config(text=str(meter1))
-        self.meter_lebel2.config(text=str(meter2))
+        self.meter_lebel1.after(0, lambda meter1=meter1: self.meter_lebel1.config(text=str(meter1)))
+        self.meter_lebel2.after(0, lambda meter2=meter2: self.meter_lebel2.config(text=str(meter2)))
+
 
     def toggle_start(self):
         if self.manager.is_running:
@@ -278,7 +278,7 @@ class PulseMeterApp:
             self.manager.setting.systemsetting.meter2 = self.combo2.get()
             self.manager.setting.save(self.manager.setting.save_filename)
             self.manager.start()
-            self.manager.set_extra_display_callback(self.update_meter_label)
+            # self.manager.set_extra_display_callback(self.update_meter_label)
             self.start_button.config(text="停止")
             print("[APP] 开始运行")
 
