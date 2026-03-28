@@ -20,12 +20,10 @@
 #include "adapt/esp32_httpd.h"
 #include "cgi/cgiwifi.h"
 #include "captive_portal.h"
-#include "dns_server.h"
 
 static const char *TAG = "captive_portal";
 static bool g_configed = 0;
 static esp_timer_handle_t prov_stop_timer;
-dns_server_handle_t dns_server;
 
 esp_err_t config_timer_start(int TIMEOUT_PERIOD);
 esp_err_t config_timer_delete(void);
@@ -38,7 +36,6 @@ static void event_handler(void *arg, esp_event_base_t event_base,
         case APP_NETWORK_EVENT_CONFIG_SUCCESS:
         case APP_NETWORK_EVENT_PROV_TIMEOUT:
             config_timer_delete();
-            stop_dns_server(dns_server);
             esp32HttpServerDisable();
             break;
         case APP_NETWORK_EVENT_PROV_START:
@@ -54,10 +51,6 @@ static void event_handler(void *arg, esp_event_base_t event_base,
 esp_err_t captive_portal_start(void)
 {
     esp_err_t ret;
-
-    // Start the DNS server that will redirect all queries to the softAP IP
-    dns_server_config_t config = DNS_SERVER_CONFIG_SINGLE("*" /* all A queries */, "WIFI_AP_DEF" /* softAP netif ID */);
-    dns_server = start_dns_server(&config);
 
     /* start http server task */
     ESP_LOGD(TAG, "Free heap size before enable http server: %d", esp_get_free_heap_size());

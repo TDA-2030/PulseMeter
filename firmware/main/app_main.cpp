@@ -6,10 +6,8 @@
 #include "nvs_flash.h"
 #include "helper.h"
 #include "setting.h"
-#include "adc.h"
 #include "web.h"
 #include "board.h"
-#include "led.h"
 #include "meter_dial.h"
 #include "cpu_load.h"
 
@@ -32,9 +30,7 @@ extern "C" void app_main()
     }
     ESP_ERROR_CHECK( err );
 
-    led_init();
     g_settings.load();
-    adc_init();
     vTaskDelay(pdMS_TO_TICKS(100));
     bsp_i2c_init();
 

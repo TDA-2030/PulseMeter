@@ -18,7 +18,6 @@
 #include "esp_log.h"
 #include "meter_dial.h"
 #include "board.h"
-#include "led.h"
 
 static const char *TAG = "motor";
 
