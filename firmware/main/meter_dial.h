@@ -55,6 +55,11 @@ public:
         this->max_duty = max_duty;
     }
 
+    uint32_t get_max_duty() const
+    {
+        return max_duty;
+    }
+
 
 private:
     const char *name;

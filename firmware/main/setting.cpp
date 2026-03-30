@@ -15,15 +15,17 @@ Setting::Setting()
 void Setting::restortDefault()
 {
     ESP_LOGI(TAG, "restortDefault");
-    mode = 0;
- 
+    mode             = 0;
+    meter1_max_duty  = 448;  // calibrated default for meter 1
+    meter2_max_duty  = 236;  // calibrated default for meter 2
 }
 
 void Setting::print()
 {
     ESP_LOGI(TAG, "Settings:");
     ESP_LOGI(TAG, "mode: %d", mode);
-
+    ESP_LOGI(TAG, "meter1_max_duty: %lu", meter1_max_duty);
+    ESP_LOGI(TAG, "meter2_max_duty: %lu", meter2_max_duty);
     ESP_LOGI(TAG, "checksum: %u", checksum);
 }
 

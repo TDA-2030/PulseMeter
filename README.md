@@ -1,10 +1,11 @@
 # PulseMeter
 
-PulseMeter 是一个基于 ESP32 的实时 CPU 利用率指针仪表显示项目。通过 TCP 通信，PulseMeter 能够连接电脑，接收并显示 CPU 负载，采用指针仪表风格的视觉效果，直观反映系统性能状态。
+PulseMeter 是一个基于 ESP32 的实时 CPU 利用率指针仪表显示项目。通过 TCP 通信，PulseMeter 能够连接电脑，接收并显示 CPU 负载，采用 PWM 输出驱动指针实现仪表风格的视觉效果，直观反映系统性能状态。
 
 ## 特性
 
-- 实时显示电脑 CPU 利用率  
+- 两个独立指针
+- 实时显示电脑系统信息，可任意选择支持的系统信息（CPU 利用率、内存使用率、温度、音频电平等）
 - 基于 ESP32 的 TCP 服务器，稳定接收数据  
 - 采用指针式仪表界面，简单易读  
 - Python 客户端程序，跨平台获取 CPU 负载数据  
@@ -18,7 +19,7 @@ PulseMeter 是一个基于 ESP32 的实时 CPU 利用率指针仪表显示项目
 
 ## 软件需求
 
-- ESP-IDF 开发环境（版本 4.x 或更高）  
+- ESP-IDF 开发环境（版本 5.5）  
 - Python 3（用于运行 CPU 利用率发送脚本）  
 - Python 库：`psutil` （安装命令：`pip install psutil`）
 

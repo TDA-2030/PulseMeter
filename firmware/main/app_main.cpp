@@ -9,7 +9,7 @@
 #include "web.h"
 #include "board.h"
 #include "meter_dial.h"
-#include "cpu_load.h"
+#include "meter_server.h"
 
 static const char *TAG = "app_main";
 
@@ -18,7 +18,7 @@ MeterDial meters[] = {
     MeterDial("Meter2"),
 };
 
-CpuLoad server;
+MeterServer server;
 
 extern "C" void app_main()
 {
@@ -43,8 +43,9 @@ extern "C" void app_main()
     meters[0].init(BOARD_IO_METER1);
     meters[1].init(BOARD_IO_METER2);
 
-    meters[0].set_max_duty(448);
-    meters[1].set_max_duty(236);
+    // Load calibrated duty ceilings from NVS (defaults: 448 / 236)
+    meters[0].set_max_duty(g_settings.meter1_max_duty);
+    meters[1].set_max_duty(g_settings.meter2_max_duty);
 
     meters[0].waitSelfTestDone();
     meters[1].waitSelfTestDone();

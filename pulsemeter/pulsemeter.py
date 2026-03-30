@@ -2,6 +2,9 @@ import tkinter as tk
 from tkinter import ttk
 import time
 import os
+import platform
+import shutil
+import subprocess
 import threading
 import socket
 import struct
@@ -18,7 +21,87 @@ from settings import Setting
 from zeroconf import ServiceBrowser, ServiceStateChange, Zeroconf
 
 ROOT = Path(os.path.abspath(__file__)).parent
-print(ROOT)
+print(f"ROOT: {ROOT}")
+
+# ---------- Bundled font loader ----------
+# Drop any TTF/OTF files into  pulsemeter/fonts/  and they will be registered
+# at startup without touching the user's system font directories.
+#
+# Current bundle: Lato-Regular.ttf  Lato-Bold.ttf  Lato-Light.ttf
+#   (Lato is a clean, modern geometric sans-serif — consistent on all platforms)
+_BUNDLED_FAMILY = 'Segoe UI'
+_FALLBACK_FAMILY = 'Segoe UI' if platform.system() == 'Windows' else 'DejaVu Sans'
+
+
+def _load_bundled_fonts() -> str:
+    """
+    Register fonts from  pulsemeter/fonts/  so Tk can use them by family name.
+
+    Windows : AddFontResourceEx FR_PRIVATE — process-only, nothing written to disk.
+    Linux   : Sync fonts to ~/.local/share/fonts/PulseMeter/, run fc-cache, then
+              call FcInitReinitialize() so the current process sees the updated
+              system font set immediately — before tk.Tk() is created.
+    macOS   : CTFontManagerRegisterFontsForURL scope=Process — nothing written.
+    """
+    font_dir = ROOT / 'fonts'
+    if not font_dir.is_dir():
+        return _FALLBACK_FAMILY
+
+    files = list(font_dir.glob('*.ttf')) + list(font_dir.glob('*.TTF')) + list(font_dir.glob('*.otf'))
+    if not files:
+        return _FALLBACK_FAMILY
+
+    system = platform.system()
+    try:
+        if system == 'Windows':
+            import ctypes
+            for f in files:
+                # FR_PRIVATE (0x10): loaded for this process only
+                ctypes.windll.gdi32.AddFontResourceExW(str(f), 0x10, 0)
+
+        elif system == 'Linux':
+            import ctypes
+            # Sync font files into the XDG user font dir (fontconfig scans this automatically)
+            xdg_data = Path(os.environ.get('XDG_DATA_HOME', Path.home() / '.local' / 'share'))
+            dst_dir = xdg_data / 'fonts' / 'PulseMeter'
+            dst_dir.mkdir(parents=True, exist_ok=True)
+            changed = False
+            for f in files:
+                dst = dst_dir / f.name
+                if not dst.exists() or dst.stat().st_mtime < f.stat().st_mtime:
+                    shutil.copy2(f, dst)
+                    changed = True
+            if changed:
+                # Rebuild the per-directory fontconfig cache
+                subprocess.run(['fc-cache', '-f', str(dst_dir)],
+                               capture_output=True, timeout=15)
+            # Reinitialise fontconfig in this process so it reads the updated cache.
+            # Must happen before tk.Tk() so Xft/Tk sees the fonts at window creation.
+            fc = ctypes.cdll.LoadLibrary('libfontconfig.so.1')
+            fc.FcInitReinitialize.restype = ctypes.c_int
+            fc.FcInitReinitialize()
+
+        elif system == 'Darwin':
+            import ctypes, ctypes.util
+            ct = ctypes.cdll.LoadLibrary(ctypes.util.find_library('CoreText'))
+            cf = ctypes.cdll.LoadLibrary(ctypes.util.find_library('CoreFoundation'))
+            for f in files:
+                path = str(f).encode('utf-8')
+                url = cf.CFURLCreateFromFileSystemRepresentation(
+                    None, path, len(path), False)
+                ct.CTFontManagerRegisterFontsForURL(url, 1, None)
+                cf.CFRelease(url)
+
+    except Exception as e:
+        print(f'[font] Failed to load bundled fonts: {e}')
+        return _FALLBACK_FAMILY
+
+    print(f'[font] Loaded {len(files)} font(s) from {font_dir}')
+    return _BUNDLED_FAMILY
+
+
+_FF = _load_bundled_fonts()
+print(f'[font] Using font family: {_FF}')
 
 
 # -------------------- Device discovery (mDNS) --------------------
@@ -391,14 +474,22 @@ class DataSender:
                     print(f"[TCP] Recv: no pending request for seq={seq}")
 
 
+# Metric display labels — BMP-only Unicode symbols render on all platforms and fonts.
+# Raw keys are used everywhere internally; labels appear only in the UI comboboxes.
+METRIC_LABELS = {
+    'cpu':           '⚡ CPU',
+    'memory':        '🧠 Memory',
+    'disk_io_read':  '📤 Disk Read',
+    'disk_io_write': '📥 Disk Write',
+    'net_up':        '🔼 Net Up',
+    'net_down':      '🔽 Net Down',
+    'audio':         '🎵 Audio',
+}
+METRIC_KEYS = {v: k for k, v in METRIC_LABELS.items()}
+
+
 class DataCollector:
     def __init__(self):
-        """
-        :param interval: 数据采集间隔（秒）
-        :param metrics: 要采集的指标列表，
-                        可选 ['cpu', 'memory', 'disk_io', 'net', 'audio']
-        :param callback: 数据采集完成回调函数，函数参数为采集的数据字典
-        """
         self.interval = None
         self.metrics: list[str] = []
         self.callback = None
@@ -407,42 +498,100 @@ class DataCollector:
         self._prev_net = psutil.net_io_counters()
         self._prev_disk = psutil.disk_io_counters()
         self._mic = sc.get_microphone(id=str(sc.default_speaker().name), include_loopback=True)
+        # Audio is sampled in a dedicated thread to avoid blocking the main loop.
+        # The recorder is kept open permanently to eliminate per-iteration open overhead.
+        self._audio_level: float = 0.0
+        self._audio_stop = threading.Event()
+        self._audio_thread: threading.Thread | None = None
+        # Cache of the last non-audio data frame.  Written by _run() at 0.5 s;
+        # read by _audio_loop() so it can assemble a complete dict at 50 ms rate.
+        # Dict reference replacement is atomic under the GIL, so no extra lock needed.
+        self._non_audio_cache: dict = {}
 
     def get_available_metrics(self):
-        return ["cpu", "memory", "disk_io_read", "disk_io_write", "net_up", "net_down", "audio"]
+        # Returns display labels (with icons); use METRIC_KEYS to convert back to raw keys.
+        return list(METRIC_LABELS.values())
 
     def start(self, interval=1.0, metrics=None, callback=None):
         self.interval = interval
         self.metrics = metrics
         self.callback = callback
-        """启动采集线程"""
         if self._thread is None or not self._thread.is_alive():
             self._stop_event.clear()
             self._thread = threading.Thread(target=self._run, daemon=True)
             self._thread.start()
+        # Start a dedicated audio thread when audio is selected.
+        # It keeps the recorder open permanently so the main loop is never blocked.
+        if "audio" in (metrics or []):
+            if self._audio_thread is None or not self._audio_thread.is_alive():
+                self._audio_stop.clear()
+                self._audio_thread = threading.Thread(
+                    target=self._audio_loop, daemon=True, name="DataCollector-audio")
+                self._audio_thread.start()
 
     def stop(self):
-        """停止采集线程"""
         self._stop_event.set()
+        self._audio_stop.set()
         if self._thread:
-            self._thread.join()
+            self._thread.join(timeout=self.interval + 1.0 if self.interval else 3.0)
+        if self._audio_thread and self._audio_thread.is_alive():
+            self._audio_thread.join(timeout=3.0)
 
-    def _get_audio_level(self, duration, samplerate=8000):
+    # Fixed audio analysis window independent of the main collection interval.
+    # 50 ms gives ~20 Hz beat-detection updates while keeping FFT bins fine
+    # enough to resolve 60–300 Hz bass content.
+    _AUDIO_CHUNK_S = 0.05
+
+    def _audio_loop(self):
         """
-        在整个 duration 内采样系统音频，计算 RMS 电平
-        返回值范围 0~1
+        Dedicated audio sampling thread.
+        Keeps a single recorder context open and continuously updates
+        self._audio_level so the main collection loop can read it without blocking.
+
+        Uses a fixed chunk size (_AUDIO_CHUNK_S) that is independent of the
+        main collection interval, so selecting audio on one meter does not
+        force non-audio metrics to run at a faster (wasteful) rate.
         """
+        samplerate = 8000
+        # Fixed window regardless of the main loop interval
+        chunk_frames = max(1, int(self._AUDIO_CHUNK_S * samplerate))
+
+        # Bass band: kick drum + bass guitar (60–300 Hz).
+        # Zeroing everything outside this range in the FFT removes cymbals,
+        # vocals and high-frequency noise that obscure the rhythmic beat signal.
+        FREQ_LOW  = 60    # Hz — below this is rumble/DC
+        FREQ_HIGH = 300   # Hz — above this is mids/highs
+
         try:
-            numframes = int(duration * samplerate)
             with self._mic.recorder(samplerate=samplerate, channels=1) as rec:
-                data = rec.record(numframes=numframes)
-                if data.size == 0:
-                    return 0.0
-                rms = np.sqrt(np.mean(np.square(data)))
-                return round(100*min(rms, 1.0), 2)  # 限制最大值为1.0
+                while not self._audio_stop.is_set():
+                    buf = rec.record(numframes=chunk_frames).flatten()
+                    if buf.size == 0:
+                        continue
+
+                    # FFT band-pass: keep only FREQ_LOW ~ FREQ_HIGH
+                    spectrum = np.fft.rfft(buf)
+                    freqs    = np.fft.rfftfreq(len(buf), d=1.0 / samplerate)
+                    spectrum[(freqs < FREQ_LOW) | (freqs > FREQ_HIGH)] = 0
+                    bass     = np.fft.irfft(spectrum, len(buf))
+
+                    rms = np.sqrt(np.mean(np.square(bass)))
+                    if rms > 1e-6:
+                        # dB scale: [-60 dB, 0 dB] → [0, 100]
+                        db = 20 * np.log10(rms)
+                        self._audio_level = round(max(0.0, min(100.0, (db + 60) / 60 * 100)), 2)
+                    else:
+                        self._audio_level = 0.0
+
+                    # Drive the callback at audio rate.  Take a GIL-safe snapshot
+                    # of the non-audio cache and inject the fresh audio level so
+                    # the sender and UI both update at _AUDIO_CHUNK_S (50 ms).
+                    if self.callback:
+                        data = dict(self._non_audio_cache)
+                        data['audio'] = self._audio_level
+                        self.callback(data)
         except Exception:
             traceback.print_exc()
-            return None  # 没有音频设备时返回 None
 
     def _run(self):
         # Pre-warm cpu_percent so the first real sample isn't always 0.0
@@ -460,36 +609,46 @@ class DataCollector:
             tick_start = time.perf_counter()
             data = {}
 
+            # Snapshot metrics and interval once per iteration so that a
+            # concurrent update_metrics() call cannot cause inconsistency
+            # between the multiple "in metrics" checks below.
+            metrics  = self.metrics
+            interval = self.interval
+
             # 常规指标
-            if "cpu" in self.metrics:
+            if "cpu" in metrics:
                 data["cpu"] = psutil.cpu_percent(interval=None)
-            if "memory" in self.metrics:
+            if "memory" in metrics:
                 mem = psutil.virtual_memory()
                 data["memory"] = mem.percent
-            if "disk_io_read" in self.metrics or "disk_io_write" in self.metrics:
+            if "disk_io_read" in metrics or "disk_io_write" in metrics:
                 disk = psutil.disk_io_counters()
                 # Use actual elapsed time for accurate speed calculation
-                actual_dt = time.perf_counter() - tick_start or self.interval
+                actual_dt = time.perf_counter() - tick_start or interval
                 read_speed = (disk.read_bytes - self._prev_disk.read_bytes) / actual_dt
                 write_speed = (disk.write_bytes - self._prev_disk.write_bytes) / actual_dt
-                key = "disk_io_read" if "disk_io_read" in self.metrics else "disk_io_write"
+                key = "disk_io_read" if "disk_io_read" in metrics else "disk_io_write"
                 data[key] = {"MB/s": round((read_speed if key == "disk_io_read" else write_speed) / (1024 * 1024), 2)}
                 self._prev_disk = disk
-            if "net_up" in self.metrics or "net_down" in self.metrics:
+            if "net_up" in metrics or "net_down" in metrics:
                 net = psutil.net_io_counters()
-                actual_dt = time.perf_counter() - tick_start or self.interval
+                actual_dt = time.perf_counter() - tick_start or interval
                 up_speed = (net.bytes_sent - self._prev_net.bytes_sent) / actual_dt
                 down_speed = (net.bytes_recv - self._prev_net.bytes_recv) / actual_dt
-                key = "net_up" if "net_up" in self.metrics else "net_down"
+                key = "net_up" if "net_up" in metrics else "net_down"
                 data[key] = {"MB/s": round((up_speed if key == "net_up" else down_speed) / (1024 * 1024), 2)}
                 self._prev_net = net
-            if "audio" in self.metrics:
-                # Audio recording blocks for the full interval by design
-                data["audio"] = self._get_audio_level(self.interval, samplerate=8000)
-
-            # 回调输出
-            if self.callback:
-                self.callback(data)
+            if "audio" in metrics:
+                # When audio is active the _audio_loop drives the callback at
+                # _AUDIO_CHUNK_S rate.  Here we only refresh the non-audio cache
+                # so the audio loop can pair the latest collected values with
+                # each fresh audio sample.  Do NOT fire the callback from here —
+                # that would produce a second, slower stream of audio frames.
+                self._non_audio_cache = data  # atomic dict replace under GIL
+            else:
+                # No audio: fire callback at the normal 0.5 s collection rate.
+                if self.callback:
+                    self.callback(data)
 
             # Sleep until the next absolute deadline, then advance it.
             # If we're already past the deadline, skip the sleep but still
@@ -497,7 +656,7 @@ class DataCollector:
             remaining = next_deadline - time.perf_counter()
             if remaining > 0:
                 time.sleep(remaining)
-            next_deadline += self.interval
+            next_deadline += interval
 
 
 # -------------------- 仪表管理类 --------------------
@@ -508,26 +667,82 @@ class MeterManager:
         self.collector = DataCollector()
         self.extra_display_callback = None
         self.is_running = False
+        self._calibrating = False   # when True, override output with 100/100
+
+    @staticmethod
+    def _to_pct(v) -> int:
+        """Convert a raw metric value to a 0–100 integer suitable for the TCP frame.
+        Numeric values are clamped; MB/s dicts are scaled (5 MB/s → 100)."""
+        if isinstance(v, dict):
+            return int(min(v.get('MB/s', 0.0) * 20.0, 100.0))
+        try:
+            return max(0, min(100, int(float(v))))
+        except (TypeError, ValueError):
+            return 0
 
     def data_cb(self, data):
         try:
-            data1 = data[self.collector.metrics[0]]
-            data2 = data[self.collector.metrics[1]]
-            print(f"[CPU] Sending data: {data1}, {data2}")
-            self.sender.send_data(int(data1), int(data2))
+            # Snapshot metric keys to stay consistent if restart_collector() fires
+            # concurrently on another thread.
+            metrics = self.collector.metrics
+            if len(metrics) < 2:
+                return
+            # Use .get() so a mid-switch frame missing the new key is treated as 0.
+            data1 = data.get(metrics[0], 0)
+            data2 = data.get(metrics[1], 0)
+            if self._calibrating:
+                # Send full-scale values so the needle visually reaches max_duty
+                self.sender.send_data(100, 100)
+            else:
+                pct1, pct2 = self._to_pct(data1), self._to_pct(data2)
+                print(f"[CPU] Sending data: {pct1}, {pct2}")
+                self.sender.send_data(pct1, pct2)
             if self.extra_display_callback:
                 self.extra_display_callback(data1, data2)
         except Exception as e:
             print(f"[CPU] Loop error: {e}")
             traceback.print_exc()
 
-    def start(self, **kwargs):
-        print("[APP] Starting MeterManager", self.setting.systemsetting.__dict__)
-        self.collector.start(self.setting.systemsetting.interval, metrics=[self.setting.systemsetting.meter1, self.setting.systemsetting.meter2], callback=self.data_cb)
+    def start(self):
+        metrics = [self.setting.systemsetting.meter1, self.setting.systemsetting.meter2]
+        # All metrics use a 0.5 s collection interval.  Audio is sampled by its
+        # own dedicated thread at _AUDIO_CHUNK_S (50 ms) and exposed via
+        # _audio_level, so the main loop just does a non-blocking read.
+        interval = 0.5
+        print("[APP] Starting MeterManager", self.setting.systemsetting.__dict__, f"interval={interval}")
+        self.collector.start(interval, metrics=metrics, callback=self.data_cb)
         self.sender.connect(self.setting.systemsetting.server_ip, 5000)
         self.is_running = True
 
+    def start_calibration(self):
+        """Override data output with 100/100 so needles sweep to full scale."""
+        self._calibrating = True
+
+    def stop_calibration(self):
+        """Return to normal data-driven output."""
+        self._calibrating = False
+
+    def restart_collector(self, meter1: str, meter2: str):
+        """
+        Hot-swap the two metric channels without dropping the TCP connection.
+
+        Stops the current collector (joins its thread), updates settings,
+        then restarts with the new metrics.  The sender is intentionally
+        left untouched.
+
+        MUST be called from a non-UI thread — collector.stop() blocks until
+        the worker thread exits (up to interval + 1 s).
+        """
+        self.collector.stop()
+        self.setting.systemsetting.meter1 = meter1
+        self.setting.systemsetting.meter2 = meter2
+        metrics  = [meter1, meter2]
+        interval = 0.5  # audio is handled by its own thread; main loop stays at 0.5 s
+        print(f"[APP] Restarting collector: {meter1}, {meter2}  interval={interval}")
+        self.collector.start(interval, metrics=metrics, callback=self.data_cb)
+
     def stop(self):
+        self._calibrating = False
         print("[APP] Stopped MeterManager")
         self.collector.stop()
         self.sender.send_data(0, 0)
@@ -557,14 +772,16 @@ THEME = {
 }
 
 FONT = {
-    'title':  ('Segoe UI', 13, 'bold'),
-    'value':  ('Segoe UI', 28, 'bold'),
-    'card_h': ('Segoe UI', 8),
-    'normal': ('Segoe UI', 10),
-    'small':  ('Segoe UI', 9),
-    'btn':    ('Segoe UI', 10, 'bold'),
+    'title':   (_FF, 13, 'bold'),
+    'value':   (_FF, 32, 'bold'),   # enlarged for prominence
+    'unit':    (_FF, 9),            # unit label beneath value
+    'card_h':  (_FF, 11, 'bold'),
+    'normal':  (_FF, 10),
+    'small':   (_FF, 9),
+    'btn':     (_FF, 10, 'bold'),
+    'section': (_FF, 7, 'bold'),    # section headers inside settings
+    'combo':   (_FF, 11),           # metric selector dropdown
 }
-
 
 # -------------------- UI Helpers --------------------
 
@@ -583,10 +800,10 @@ class _HoverButton(tk.Button):
 
 
 class _ProgressBar(tk.Canvas):
-    """Thin horizontal progress bar drawn on a Canvas."""
+    """Horizontal progress bar — 5 px tall, colour-coded by level."""
 
     def __init__(self, master, **kw):
-        kw.setdefault('height', 3)
+        kw.setdefault('height', 5)
         kw.setdefault('highlightthickness', 0)
         super().__init__(master, **kw)
         self._value = 0.0
@@ -599,40 +816,41 @@ class _ProgressBar(tk.Canvas):
     def _redraw(self):
         self.delete('all')
         w = self.winfo_width()
+        h = self.winfo_height()
         if w <= 1:
             return
-        # Background track
-        self.create_rectangle(0, 0, w, 3, fill=THEME['border'], outline='')
+        self.create_rectangle(0, 0, w, h, fill=THEME['border'], outline='')
         filled = int(w * self._value / 100)
         if filled > 0:
             v = self._value
             color = THEME['green'] if v < 70 else THEME['yellow'] if v < 90 else THEME['red']
-            self.create_rectangle(0, 0, filled, 3, fill=color, outline='')
+            self.create_rectangle(0, 0, filled, h, fill=color, outline='')
 
 
 # -------------------- Settings Window --------------------
 
 class SettingsWindow:
     """
-    Modal settings popup for advanced options:
-    - Sample interval
-    - Per-meter max_duty calibration (with read/write from device)
+    Modal settings popup with two sections:
+      CONNECTION  — IP combo, mDNS scan, connect/disconnect
+      CALIBRATION — per-meter max_duty read/write
 
-    max_duty values are persisted back via the shared `max_duty` list.
+    Holds a reference to PulseMeterApp for bidirectional state sync.
     """
 
-    def __init__(self, parent: tk.Tk, manager: MeterManager,
-                 interval_var: tk.StringVar, max_duty: list):
-        self._manager  = manager
-        self._max_duty = max_duty   # shared [duty1, duty2] list with PulseMeterApp
+    def __init__(self, parent: tk.Tk, app: 'PulseMeterApp'):
+        self._app      = app
+        self._manager  = app.manager
+        self._max_duty = app._max_duty
 
         win = tk.Toplevel(parent)
         win.title("Settings")
-        win.geometry("360x270")
+        win.geometry("360x300")
         win.resizable(False, False)
         win.configure(bg=THEME['bg'])
         win.transient(parent)
         win.grab_set()
+        win.protocol("WM_DELETE_WINDOW", self._on_close)
         self.win = win
 
         # --- Header ---
@@ -643,49 +861,79 @@ class SettingsWindow:
                  fg=THEME['text'], font=FONT['title']).pack(side='left', padx=16, pady=10)
 
         # --- Body ---
-        body = tk.Frame(win, bg=THEME['bg'], padx=20, pady=14)
+        body = tk.Frame(win, bg=THEME['bg'], padx=20, pady=12)
         body.pack(fill='both', expand=True)
 
-        def lbl(text, row):
-            tk.Label(body, text=text, bg=THEME['bg'],
-                     fg=THEME['subtext'], font=FONT['small']
-                     ).grid(row=row, column=0, sticky='w', pady=6)
+        # -- Section: CONNECTION --
+        tk.Label(body, text="CONNECTION", bg=THEME['bg'],
+                 fg=THEME['accent'], font=FONT['section']).grid(
+                     row=0, column=0, columnspan=4, sticky='w', pady=(0, 4))
 
-        # Interval row
-        lbl("Sample interval (s)", 0)
-        ttk.Entry(body, textvariable=interval_var, width=10,
-                  style='Dark.TEntry').grid(row=0, column=1, columnspan=3,
-                                            sticky='ew', padx=(12, 0), pady=6)
+        tk.Label(body, text="IP", bg=THEME['bg'],
+                 fg=THEME['subtext'], font=FONT['small']).grid(
+                     row=1, column=0, sticky='w', pady=6)
 
-        # Separator
+        self._ip_combo = ttk.Combobox(body, width=16, style='Dark.TCombobox')
+        self._ip_combo.set(self._manager.setting.systemsetting.server_ip)
+        self._ip_combo['values'] = app._discovered_ips
+        self._ip_combo.grid(row=1, column=1, sticky='ew', padx=(8, 4), pady=6)
+
+        _HoverButton(body, text="↻", bg=THEME['bg'], hover_bg=THEME['border'],
+                     fg=THEME['subtext'], font=(_FF, 13),
+                     relief='flat', cursor='hand2',
+                     command=self._rescan).grid(row=1, column=2, padx=(0, 6))
+
+        self._conn_btn = _HoverButton(
+            body, text="", bg=THEME['accent'], hover_bg='#a6c8ff',
+            fg=THEME['bg'], font=FONT['btn'],
+            relief='flat', cursor='hand2', width=7, padx=4,
+            command=self._toggle_connect)
+        self._conn_btn.grid(row=1, column=3, pady=6)
+        self.refresh_connect_btn()
+
+        # -- Separator --
         tk.Frame(body, bg=THEME['border'], height=1).grid(
-            row=1, column=0, columnspan=4, sticky='ew', pady=(4, 8))
+            row=2, column=0, columnspan=4, sticky='ew', pady=(4, 10))
 
-        # Max-duty rows for each meter
-        specs = [
-            (max_duty[0], "Meter 1  max duty"),
-            (max_duty[1], "Meter 2  max duty"),
-        ]
-        for idx, (default, name) in enumerate(specs, start=1):
-            lbl(name, idx + 1)
+        # -- Section: CALIBRATION --
+        tk.Label(body, text="CALIBRATION", bg=THEME['bg'],
+                 fg=THEME['accent2'], font=FONT['section']).grid(
+                     row=3, column=0, columnspan=3, sticky='w', pady=(0, 4))
+
+        self._calib_btn = _HoverButton(
+            body, text="▶ Cal", bg=THEME['card'], hover_bg=THEME['border'],
+            fg=THEME['accent2'], font=FONT['small'],
+            relief='flat', cursor='hand2', width=7, padx=2,
+            command=self._toggle_calibrate)
+        self._calib_btn.grid(row=3, column=3, pady=(0, 4))
+        self._refresh_calib_btn()
+
+        for idx, (default, name) in enumerate([
+            (self._max_duty[0], "Meter 1  max duty"),
+            (self._max_duty[1], "Meter 2  max duty"),
+        ]):
+            tk.Label(body, text=name, bg=THEME['bg'],
+                     fg=THEME['subtext'], font=FONT['small']).grid(
+                         row=4 + idx, column=0, sticky='w', pady=6)
+
             spin = ttk.Spinbox(body, from_=1, to=4095, increment=1,
                                width=7, style='Dark.TSpinbox')
             spin.set(default)
-            spin.grid(row=idx + 1, column=1, padx=(12, 4), pady=6)
+            spin.grid(row=4 + idx, column=1, padx=(8, 4), pady=6)
 
             btn_r = _HoverButton(body, text="R", width=2,
                                  bg=THEME['card'], fg=THEME['accent'],
                                  font=FONT['small'], relief='flat', cursor='hand2',
-                                 command=lambda i=idx, s=spin: self._read_duty(i, s))
-            btn_r.grid(row=idx + 1, column=2, padx=2)
+                                 command=lambda i=idx+1, s=spin: self._read_duty(i, s))
+            btn_r.grid(row=4 + idx, column=2, padx=2)
 
             btn_w = _HoverButton(body, text="W", width=2,
                                  bg=THEME['card'], fg=THEME['accent2'],
                                  font=FONT['small'], relief='flat', cursor='hand2',
-                                 command=lambda i=idx, s=spin: self._write_duty(i, s))
-            btn_w.grid(row=idx + 1, column=3, padx=2)
+                                 command=lambda i=idx+1, s=spin: self._write_duty(i, s))
+            btn_w.grid(row=4 + idx, column=3, padx=2)
 
-            if idx == 1:
+            if idx == 0:
                 self._spin1, self._btn1_r, self._btn1_w = spin, btn_r, btn_w
             else:
                 self._spin2, self._btn2_r, self._btn2_w = spin, btn_r, btn_w
@@ -696,17 +944,79 @@ class SettingsWindow:
         footer = tk.Frame(win, bg=THEME['surface'], height=48)
         footer.pack(fill='x', side='bottom')
         footer.pack_propagate(False)
-        _HoverButton(footer, text="Close", bg=THEME['accent'], hover_bg='#a6c8ff',
-                     fg=THEME['bg'], font=FONT['btn'], relief='flat', cursor='hand2',
+        _HoverButton(footer, text="Close", bg=THEME['card'], hover_bg=THEME['border'],
+                     fg=THEME['text'], font=FONT['btn'], relief='flat', cursor='hand2',
                      padx=20, command=self._on_close).pack(side='right', padx=16, pady=10)
+
+    # ------------------------------------------------------------------
+    # Public refresh methods called by PulseMeterApp
+    # ------------------------------------------------------------------
+
+    def refresh_connect_btn(self):
+        """Sync the connect/disconnect button text and colour to manager state."""
+        if self._manager.is_running:
+            self._conn_btn._normal_bg = THEME['red']
+            self._conn_btn._hover_bg  = '#ffa0b0'
+            self._conn_btn.config(text="■ Discon.", bg=THEME['red'], fg=THEME['bg'])
+        else:
+            self._conn_btn._normal_bg = THEME['accent']
+            self._conn_btn._hover_bg  = '#a6c8ff'
+            self._conn_btn.config(text="▶ Connect", bg=THEME['accent'], fg=THEME['bg'])
+        # Calibrate button is only usable while connected
+        # (_calib_btn may not exist yet during __init__ construction)
+        if hasattr(self, '_calib_btn'):
+            self._refresh_calib_btn()
+
+    def refresh_ip_list(self, ips: list):
+        """Update the IP combo when mDNS discovery changes."""
+        self._ip_combo['values'] = ips
+
+    # ------------------------------------------------------------------
+    # Internal handlers
+    # ------------------------------------------------------------------
+
+    def _toggle_connect(self):
+        """Write the selected IP to settings then delegate to app.toggle_start()."""
+        self._app.manager.setting.systemsetting.server_ip = self._ip_combo.get()
+        self._app.toggle_start()
+
+    def _toggle_calibrate(self):
+        """Start or stop calibration mode (sends 100/100 to drive needles to max)."""
+        if not self._manager.is_running:
+            return
+        if self._manager._calibrating:
+            self._manager.stop_calibration()
+        else:
+            self._manager.start_calibration()
+        self._refresh_calib_btn()
+
+    def _refresh_calib_btn(self):
+        """Update calibrate button appearance based on connection + calibration state."""
+        if not self._manager.is_running:
+            self._calib_btn.config(state='disabled', fg=THEME['border'])
+        elif self._manager._calibrating:
+            self._calib_btn.config(state='normal',
+                                   text="■ Stop", fg=THEME['yellow'])
+            self._calib_btn._normal_bg = THEME['card']
+        else:
+            self._calib_btn.config(state='normal',
+                                   text="▶ Cal", fg=THEME['accent2'])
+            self._calib_btn._normal_bg = THEME['card']
+
+    def _rescan(self):
+        self._ip_combo['values'] = []
+        self._app._rescan_devices()
 
     def _on_close(self):
         """Persist max_duty values back to shared list before closing."""
+        # Leave calibration mode when the window is dismissed
+        self._manager.stop_calibration()
         for i, spin in enumerate([self._spin1, self._spin2]):
             try:
                 self._max_duty[i] = int(float(spin.get()))
             except ValueError:
                 pass
+        self._app._settings_win = None
         self.win.destroy()
 
     def _read_duty(self, meter_idx: int, spin: ttk.Spinbox):
@@ -758,14 +1068,14 @@ class PulseMeterApp:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("PulseMeter")
-        self.root.geometry("460x360")
+        self.root.geometry("460x310")
         self.root.resizable(False, False)
         self.root.configure(bg=THEME['bg'])
         self.manager = MeterManager()
 
-        # Shared state owned here, referenced by SettingsWindow
-        self._interval_var = tk.StringVar(value=str(self.manager.setting.systemsetting.interval))
-        self._max_duty = [448, 236]   # [meter1, meter2]
+        self._max_duty       = [448, 236]   # shared with SettingsWindow
+        self._discovered_ips: list = []     # filled by mDNS, read by SettingsWindow
+        self._settings_win   = None         # track open SettingsWindow instance
 
         self._configure_styles()
         self._build_ui()
@@ -783,7 +1093,6 @@ class PulseMeterApp:
         style = ttk.Style()
         style.theme_use('default')
 
-        # Combobox dropdown list colours (tk option database)
         self.root.option_add('*TCombobox*Listbox.background',       THEME['input_bg'])
         self.root.option_add('*TCombobox*Listbox.foreground',       THEME['text'])
         self.root.option_add('*TCombobox*Listbox.selectBackground', THEME['accent'])
@@ -826,156 +1135,226 @@ class PulseMeterApp:
 
     def _build_ui(self):
         # === Header bar ===
-        hdr = tk.Frame(self.root, bg=THEME['surface'], height=48)
+        hdr = tk.Frame(self.root, bg=THEME['surface'], height=52)
         hdr.pack(fill='x')
         hdr.pack_propagate(False)
 
-        tk.Label(hdr, text="PULSEMETER", bg=THEME['surface'],
-                 fg=THEME['accent'], font=FONT['title']).pack(side='left', padx=18, pady=12)
-
-        # Status indicator dot (green = running, red = idle)
-        self._dot_cv = tk.Canvas(hdr, width=10, height=10,
+        # Status dot — left of the title
+        self._dot_cv = tk.Canvas(hdr, width=12, height=12,
                                  bg=THEME['surface'], highlightthickness=0)
-        self._dot_cv.pack(side='right', padx=(0, 14), pady=19)
-        self._dot = self._dot_cv.create_oval(1, 1, 9, 9, fill=THEME['red'], outline='')
+        self._dot_cv.pack(side='left', padx=(16, 8), pady=20)
+        self._dot = self._dot_cv.create_oval(1, 1, 11, 11, fill=THEME['red'], outline='')
 
-        # Settings gear button
-        _HoverButton(hdr, text="⚙", bg=THEME['surface'], hover_bg=THEME['border'],
-                     fg=THEME['subtext'], font=('Segoe UI', 14),
-                     relief='flat', cursor='hand2', padx=4,
-                     command=self._open_settings).pack(side='right', padx=2, pady=8)
+        tk.Label(hdr, text="PULSEMETER", bg=THEME['surface'],
+                 fg=THEME['text'], font=FONT['title']).pack(side='left', pady=14)
+
+        # Gear button — accent colour when disconnected to guide the user
+        self._gear_btn = _HoverButton(
+            hdr, text="⚙", bg=THEME['surface'], hover_bg=THEME['border'],
+            fg=THEME['accent'], font=(_FF, 14),
+            relief='flat', cursor='hand2', padx=4,
+            command=self._open_settings)
+        self._gear_btn.pack(side='right', padx=(2, 12), pady=8)
+
+        # Accent line below the header
+        acc = tk.Canvas(self.root, height=2, bg=THEME['bg'], highlightthickness=0)
+        acc.pack(fill='x')
+        acc.bind('<Configure>', lambda e: (
+            acc.delete('all'),
+            acc.create_rectangle(0, 0, e.width, 2, fill=THEME['accent'], outline='')
+        ))
 
         # === Metric cards ===
         cards = tk.Frame(self.root, bg=THEME['bg'])
-        cards.pack(fill='both', expand=True, padx=16, pady=14)
+        cards.pack(fill='both', expand=True, padx=16, pady=(12, 6))
         cards.grid_columnconfigure(0, weight=1)
         cards.grid_columnconfigure(1, weight=1)
 
-        self.combo1, self._val1, self._prog1 = self._build_card(
-            cards, col=0, title="METER 1",
+        self.combo1, self._val1, self._unit1, self._prog1 = self._build_card(
+            cards, col=0, title="METER 1", accent=THEME['accent'],
             default=self.manager.setting.systemsetting.meter1)
-        self.combo2, self._val2, self._prog2 = self._build_card(
-            cards, col=1, title="METER 2",
+        self.combo2, self._val2, self._unit2, self._prog2 = self._build_card(
+            cards, col=1, title="METER 2", accent=THEME['accent2'],
             default=self.manager.setting.systemsetting.meter2)
 
-        # === Connection bar ===
-        conn = tk.Frame(self.root, bg=THEME['surface'], height=60)
-        conn.pack(fill='x', side='bottom')
-        conn.pack_propagate(False)
+        # Dynamic metric switching — fires on the main thread (Tkinter event loop),
+        # so it is safe to read combo state and schedule background work here.
+        self.combo1.bind('<<ComboboxSelected>>', self._on_metric_changed)
+        self.combo2.bind('<<ComboboxSelected>>', self._on_metric_changed)
 
-        bar = tk.Frame(conn, bg=THEME['surface'])
-        bar.pack(fill='both', expand=True, padx=16, pady=10)
+        # === Hint label (only visible when disconnected) ===
+        self._hint = tk.Label(
+            self.root,
+            text="○  Not connected — open ⚙ to connect",
+            bg=THEME['bg'], fg=THEME['border'], font=FONT['small'])
+        self._hint.pack(pady=(0, 8))
 
-        tk.Label(bar, text="IP", bg=THEME['surface'],
-                 fg=THEME['subtext'], font=FONT['small']).pack(side='left', padx=(0, 6))
-
-        self.ip_combo = ttk.Combobox(bar, width=18, style='Dark.TCombobox')
-        self.ip_combo.set(self.manager.setting.systemsetting.server_ip)
-        self.ip_combo.pack(side='left', padx=(0, 4))
-
-        _HoverButton(bar, text="↻", bg=THEME['surface'], hover_bg=THEME['border'],
-                     fg=THEME['subtext'], font=('Segoe UI', 14),
-                     relief='flat', cursor='hand2',
-                     command=self._rescan_devices).pack(side='left', padx=(0, 12))
-
-        self._connect_btn = _HoverButton(
-            bar, text="Connect  ▶",
-            bg=THEME['accent'], hover_bg='#a6c8ff',
-            fg=THEME['bg'], font=FONT['btn'],
-            relief='flat', cursor='hand2', padx=14,
-            command=self.toggle_start)
-        self._connect_btn.pack(side='right')
-
-    def _build_card(self, parent: tk.Frame, col: int, title: str, default: str):
-        """Build and grid a single metric card. Returns (combo, value_label, progress_bar)."""
+    def _build_card(self, parent: tk.Frame, col: int, title: str,
+                    accent: str, default: str):
+        """Build and grid a metric card. Returns (combo, val_label, unit_label, progress)."""
         padx = (0, 8) if col == 0 else (8, 0)
-        card = tk.Frame(parent, bg=THEME['card'],
-                        highlightbackground=THEME['border'], highlightthickness=1)
-        card.grid(row=0, column=col, sticky='nsew', padx=padx)
 
-        inner = tk.Frame(card, bg=THEME['card'], padx=14, pady=12)
+        # 4 px coloured left border via a thin accent-coloured wrapper frame
+        wrapper = tk.Frame(parent, bg=accent)
+        wrapper.grid(row=0, column=col, sticky='nsew', padx=padx)
+
+        card = tk.Frame(wrapper, bg=THEME['card'])
+        card.pack(fill='both', expand=True, padx=(4, 0))
+
+        inner = tk.Frame(card, bg=THEME['card'], padx=12, pady=10)
         inner.pack(fill='both', expand=True)
 
         tk.Label(inner, text=title, bg=THEME['card'],
                  fg=THEME['subtext'], font=FONT['card_h']).pack(anchor='w')
 
         combo = ttk.Combobox(inner, values=self.manager.collector.get_available_metrics(),
-                             width=15, state='readonly', style='Dark.TCombobox')
-        combo.set(default)
+                             width=15, state='readonly', style='Dark.TCombobox',
+                             font=FONT['combo'])
+        # default is a raw key from settings; convert to display label for the combobox
+        combo.set(METRIC_LABELS.get(default, default))
         combo.pack(fill='x', pady=(6, 0))
 
         val_lbl = tk.Label(inner, text="—", bg=THEME['card'],
-                           fg=THEME['accent'], font=FONT['value'])
-        val_lbl.pack(pady=(10, 0))
+                           fg=accent, font=FONT['value'])
+        val_lbl.pack(pady=(8, 0))
+
+        unit_lbl = tk.Label(inner, text="", bg=THEME['card'],
+                            fg=THEME['subtext'], font=FONT['unit'])
+        unit_lbl.pack()
 
         prog = _ProgressBar(inner, bg=THEME['card'])
-        prog.pack(fill='x', pady=(8, 0))
+        prog.pack(fill='x', pady=(6, 0))
 
-        return combo, val_lbl, prog
+        return combo, val_lbl, unit_lbl, prog
 
     # ------------------------------------------------------------------
     # Event handlers
     # ------------------------------------------------------------------
 
     def _open_settings(self):
-        SettingsWindow(self.root, self.manager, self._interval_var, self._max_duty)
+        """Open settings window; bring existing one to front if already open."""
+        if self._settings_win is not None:
+            try:
+                self._settings_win.win.focus_force()
+                return
+            except tk.TclError:
+                self._settings_win = None
+        self._settings_win = SettingsWindow(self.root, self)
 
     def _on_devices_changed(self):
         """Called from the mDNS worker thread — marshal update to main thread."""
         devices = self.discovery.get_devices()
-        values  = [ip for _, ip in devices]
+        ips     = [ip for _, ip in devices]
 
         def update():
-            self.ip_combo['values'] = values
-            # Auto-select the first discovered device when the field is empty
-            if values and not self.ip_combo.get():
-                self.ip_combo.set(values[0])
+            self._discovered_ips = ips
+            # Refresh IP combo inside settings window if it is open
+            if self._settings_win is not None:
+                try:
+                    self._settings_win.refresh_ip_list(ips)
+                except tk.TclError:
+                    self._settings_win = None
+            # Auto-connect when exactly one device is on the network
+            if len(ips) == 1 and not self.manager.is_running:
+                print(f"[mDNS] Single device @ {ips[0]} — auto-connecting")
+                self.manager.setting.systemsetting.server_ip = ips[0]
+                self.toggle_start()
 
         self.root.after(0, update)
 
     def _rescan_devices(self):
         """Restart mDNS discovery and clear stale device list."""
-        self.ip_combo['values'] = []
+        self._discovered_ips = []
         self.discovery.start()
 
     @staticmethod
     def _fmt(v) -> tuple:
-        """Return (display_str, progress_pct 0–100) for a raw metric value."""
+        """Return (display_str, unit_str, progress_pct 0–100) for a raw metric value."""
         if isinstance(v, dict):
             mb = v.get('MB/s', 0.0)
-            return f"{mb:.1f}", min(mb * 20.0, 100.0)   # 5 MB/s → 100 %
+            return f"{mb:.1f}", "MB/s", min(mb * 20.0, 100.0)
         try:
             f = float(v)
-            return f"{f:.1f}", f
+            return f"{f:.1f}", "%", f
         except (TypeError, ValueError):
-            return "—", 0.0
+            return "—", "", 0.0
 
     def update_meter_label(self, meter1, meter2):
         """Collector thread callback — must marshal to the main thread."""
         def _update():
-            for val, lbl, prog in [
-                (meter1, self._val1, self._prog1),
-                (meter2, self._val2, self._prog2),
+            for val, lbl, unit_lbl, prog in [
+                (meter1, self._val1, self._unit1, self._prog1),
+                (meter2, self._val2, self._unit2, self._prog2),
             ]:
-                text, pct = self._fmt(val)
+                text, unit, pct = self._fmt(val)
                 lbl.config(text=text)
+                unit_lbl.config(text=unit)
                 prog.set_value(pct)
 
         self.root.after(0, _update)
 
     def _set_connected(self, connected: bool):
-        if connected:
-            self._dot_cv.itemconfig(self._dot, fill=THEME['green'])
-            self._connect_btn._normal_bg = THEME['red']
-            self._connect_btn._hover_bg  = '#ffa0b0'
-            self._connect_btn.config(text="Disconnect  ■",
-                                     bg=THEME['red'], fg=THEME['bg'])
-        else:
-            self._dot_cv.itemconfig(self._dot, fill=THEME['red'])
-            self._connect_btn._normal_bg = THEME['accent']
-            self._connect_btn._hover_bg  = '#a6c8ff'
-            self._connect_btn.config(text="Connect  ▶",
-                                     bg=THEME['accent'], fg=THEME['bg'])
+        self._dot_cv.itemconfig(self._dot, fill=THEME['green'] if connected else THEME['red'])
+        # Gear button: muted when connected (no action needed), accent when not (guide user)
+        self._gear_btn._normal_bg = THEME['surface']
+        self._gear_btn._hover_bg  = THEME['border']
+        self._gear_btn.config(fg=THEME['subtext'] if connected else THEME['accent'],
+                              bg=THEME['surface'])
+        self._hint.config(text="" if connected else "○  Not connected — open ⚙ to connect")
+
+        if not connected:
+            for lbl, unit_lbl, prog in [
+                (self._val1, self._unit1, self._prog1),
+                (self._val2, self._unit2, self._prog2),
+            ]:
+                lbl.config(text="—")
+                unit_lbl.config(text="")
+                prog.set_value(0)
+
+        # Sync the connect button inside settings window if it is open
+        if self._settings_win is not None:
+            try:
+                self._settings_win.refresh_connect_btn()
+            except tk.TclError:
+                self._settings_win = None
+
+    def _on_metric_changed(self, event=None):
+        """
+        Called on the main thread when either metric combo is changed.
+
+        If the manager is not yet running, the new selection will simply be
+        picked up when the user connects — no action needed.
+
+        If already running, the collector must be restarted with the new
+        metrics.  collector.stop() blocks until the worker thread exits, so
+        the restart is offloaded to a daemon thread.  Both combos are
+        temporarily disabled to prevent a second change from racing with
+        the in-flight restart.
+        """
+        # Clear the text selection highlight that ttk.Combobox leaves after picking
+        if event and hasattr(event, 'widget'):
+            event.widget.selection_clear()
+
+        if not self.manager.is_running:
+            return
+
+        m1 = METRIC_KEYS.get(self.combo1.get(), self.combo1.get())
+        m2 = METRIC_KEYS.get(self.combo2.get(), self.combo2.get())
+
+        # Disable both combos while the restart is in progress
+        self.combo1.config(state='disabled')
+        self.combo2.config(state='disabled')
+
+        def do_restart():
+            self.manager.restart_collector(m1, m2)
+            # Re-enable combos on the main thread once restart completes
+            self.root.after(0, lambda: (
+                self.combo1.config(state='readonly'),
+                self.combo2.config(state='readonly'),
+            ))
+
+        threading.Thread(target=do_restart, daemon=True,
+                         name="MetricRestart").start()
 
     def toggle_start(self):
         if self.manager.is_running:
@@ -984,13 +1363,11 @@ class PulseMeterApp:
             self._set_connected(False)
             print("[APP] stopped")
         else:
-            self.manager.setting.systemsetting.server_ip = self.ip_combo.get()
-            try:
-                self.manager.setting.systemsetting.interval = float(self._interval_var.get())
-            except ValueError:
-                pass
-            self.manager.setting.systemsetting.meter1 = self.combo1.get()
-            self.manager.setting.systemsetting.meter2 = self.combo2.get()
+            # server_ip is already written by SettingsWindow._toggle_connect
+            # or by _on_devices_changed (auto-connect); just sync the metric choice.
+            # Combo shows display labels; convert back to raw keys for internal use.
+            self.manager.setting.systemsetting.meter1 = METRIC_KEYS.get(self.combo1.get(), self.combo1.get())
+            self.manager.setting.systemsetting.meter2 = METRIC_KEYS.get(self.combo2.get(), self.combo2.get())
             self.manager.setting.save(self.manager.setting.save_filename)
             self.manager.start()
             self.manager.set_extra_display_callback(self.update_meter_label)
@@ -1038,6 +1415,7 @@ if __name__ == "__main__":
             time.sleep(1)
     else:
         root = tk.Tk()
+
         app = PulseMeterApp(root)
         tray = TrayApp(root, app)
         tray.run()

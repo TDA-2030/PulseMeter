@@ -40,13 +40,9 @@ static void initialise_mdns(void)
     mdns_hostname_set(CONFIG_EXAMPLE_MDNS_HOST_NAME);
     mdns_instance_name_set(MDNS_INSTANCE);
 
-    mdns_txt_item_t serviceTxtData[] = {
-        {"board", "esp32"},
-        {"path", "/"}
-    };
-
-    ESP_ERROR_CHECK(mdns_service_add("ESP32-WebServer", "_http", "_tcp", 80, serviceTxtData,
-                                     sizeof(serviceTxtData) / sizeof(serviceTxtData[0])));
+    // Advertise the PulseMeter TCP data service so Python clients can discover
+    // the device without manually entering an IP address.
+    ESP_ERROR_CHECK(mdns_service_add("PulseMeter", "_pulsemeter", "_tcp", 5000, NULL, 0));
 }
 
 static void event_handler(void *arg, esp_event_base_t event_base,
@@ -69,6 +65,11 @@ static void event_handler(void *arg, esp_event_base_t event_base,
         switch (event_id) {
         case IP_EVENT_STA_GOT_IP:
             ESP_LOGI(TAG, "IP_EVENT_STA_GOT_IP");
+            // Disable modem sleep so the WiFi radio stays active continuously.
+            // Default WIFI_PS_MIN_MODEM causes the AP to buffer packets between
+            // beacons (~100ms), delivering them in bursts that creates the
+            // alternating long/short interval pattern seen in meter streaming.
+            esp_wifi_set_ps(WIFI_PS_NONE);
             break;
         case IP_EVENT_STA_LOST_IP:
             break;
@@ -99,6 +100,7 @@ void start_web(void)
         captive_portal_start();
     }
     xEventGroupWaitBits(g_wifi_event_group, WIFI_STA_GOT_IP, 0, 0, portMAX_DELAY);
+    initialise_mdns();
 
     meters[0].set_percent(0);
     meters[1].set_percent(0);

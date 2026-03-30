@@ -39,7 +39,9 @@ public:
     esp_err_t load();
     esp_err_t save();
 
-    uint8_t mode;
+    uint8_t  mode;
+    uint32_t meter1_max_duty;
+    uint32_t meter2_max_duty;
 
 private:
     // std::unordered_map<std::string, Parameter> parameters; // 存储所有参数

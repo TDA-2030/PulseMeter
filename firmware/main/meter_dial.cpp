@@ -37,7 +37,7 @@ bool PWM::init(int pin1)
         .speed_mode       = LEDC_MODE,
         .duty_resolution  = LEDC_DUTY_RES,
         .timer_num        = LEDC_TIMER,
-        .freq_hz          = (uint32_t)3000,
+        .freq_hz          = (uint32_t)10000,
         .clk_cfg          = LEDC_AUTO_CLK,
         .deconfigure      = false,
     };

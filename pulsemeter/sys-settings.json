@@ -1,9 +1,9 @@
 {
   "systemsetting": {
     "setting_name": "systemsetting",
-    "interval": 0.05,
+    "interval": 0.02,
     "meter1": "cpu",
-    "meter2": "audio",
+    "meter2": "memory",
     "net_dev": "eth0"
   }
 }
