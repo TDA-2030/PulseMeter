@@ -95,13 +95,52 @@ def _hidden_import_args() -> List[str]:
 
 def _collect_args() -> List[str]:
     """
-    Return --collect-all flags for packages whose sub-modules are loaded
-    dynamically and must be present in full inside the bundle.
+    Return --collect-submodules flags for packages whose sub-modules are loaded
+    dynamically.  --collect-submodules includes only Python modules (no extra
+    data/test files), unlike --collect-all which bundles everything.
     """
-    # soundcard uses ctypes to find platform audio libraries at runtime;
-    # bundling all its Python submodules prevents import failures.
+    # soundcard and zeroconf use dynamic imports; collect Python modules only.
     packages = ['soundcard', 'zeroconf']
-    return [arg for p in packages for arg in ('--collect-all', p)]
+    return [arg for p in packages for arg in ('--collect-submodules', p)]
+
+
+def _exclude_args() -> List[str]:
+    """
+    Return --exclude-module flags for packages that are definitely unused.
+
+    numpy ships a large amount of test/build infrastructure that PyInstaller
+    cannot prune on its own.  Standard-library modules like unittest, pydoc,
+    and sqlite3 are never imported by this application.
+    """
+    excludes = [
+        # numpy internals not needed at runtime
+        'numpy.testing',
+        'numpy.distutils',
+        'numpy.f2py',
+        'numpy.random',
+        'numpy.polynomial',
+        'numpy.ma',
+        'numpy.matrixlib',
+        # test frameworks
+        'unittest',
+        '_pytest',
+        'pytest',
+        'doctest',
+        # dev / documentation tools
+        'pydoc',
+        'pdb',
+        'difflib',
+        # unused stdlib
+        'sqlite3',
+        'xmlrpc',
+        'ftplib',
+        'imaplib',
+        'smtplib',
+        'telnetlib',
+        'turtle',
+        'tkinter.test',
+    ]
+    return [arg for e in excludes for arg in ('--exclude-module', e)]
 
 
 def build(onedir: bool = False, debug: bool = False) -> int:
@@ -139,6 +178,9 @@ def build(onedir: bool = False, debug: bool = False) -> int:
 
     # --- Full package collection ---
     cmd += _collect_args()
+
+    # --- Exclude unused modules ---
+    cmd += _exclude_args()
 
     # --- Output / work paths ---
     cmd += ['--distpath', str(HERE / 'dist')]

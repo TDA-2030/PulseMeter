@@ -25,6 +25,19 @@ _hidden += [
     'PIL._tkinter_finder',
 ]
 
+_excludes = [
+    # numpy internals not needed at runtime
+    'numpy.testing', 'numpy.distutils', 'numpy.f2py',
+    'numpy.random', 'numpy.polynomial', 'numpy.ma', 'numpy.matrixlib',
+    # test frameworks
+    'unittest', '_pytest', 'pytest', 'doctest',
+    # dev / documentation tools
+    'pydoc', 'pdb', 'difflib',
+    # unused stdlib
+    'sqlite3', 'xmlrpc', 'ftplib', 'imaplib', 'smtplib',
+    'telnetlib', 'turtle', 'tkinter.test',
+]
+
 a = Analysis(
     ['pulsemeter.py'],
     pathex=[],
@@ -34,7 +47,7 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=_excludes,
     noarchive=False,
 )
 pyz = PYZ(a.pure)
