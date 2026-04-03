@@ -8,7 +8,7 @@ _SYSTEM = platform.system()
 _SEP    = ';' if _SYSTEM == 'Windows' else ':'
 
 # Runtime data: icon for pystray, fonts bundled at startup
-_datas = [('icon.png', '.')]
+_datas = [('assets/icon.ico', 'assets')]
 import os
 if os.path.isdir('fonts'):
     _datas.append(('fonts', 'fonts'))
@@ -59,5 +59,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon='icon.png',
+    icon='assets/icon.ico',
 )

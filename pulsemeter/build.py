@@ -50,10 +50,10 @@ def _data_args() -> List[str]:
     sep   = _sep()
     items = []
 
-    # icon.png — loaded at runtime by pystray for the system tray icon
-    icon = HERE / 'icon.png'
+    # assets/icon.ico — loaded at runtime by pystray for the system tray icon
+    icon = HERE / 'assets' / 'icon.ico'
     if icon.exists():
-        items += ['--add-data', f'{icon}{sep}.']
+        items += ['--add-data', f'{icon}{sep}assets']
 
     # fonts/ — bundled TTF/OTF files registered at startup
     fonts = HERE / 'fonts'
@@ -123,16 +123,11 @@ def build(onedir: bool = False, debug: bool = False) -> int:
 
     # --- Icon ---
     if SYSTEM == 'Windows':
-        ico = HERE / 'icon.ico'
+        ico = HERE / 'assets' / 'icon.ico'
         if ico.exists():
             cmd += ['--icon', str(ico)]
-        else:
-            # PyInstaller accepts PNG on Windows when Pillow is installed
-            icon_png = HERE / 'icon.png'
-            if icon_png.exists():
-                cmd += ['--icon', str(icon_png)]
     elif SYSTEM == 'Darwin':
-        icns = HERE / 'icon.icns'
+        icns = HERE / 'assets' / 'icon.icns'
         if icns.exists():
             cmd += ['--icon', str(icns)]
 

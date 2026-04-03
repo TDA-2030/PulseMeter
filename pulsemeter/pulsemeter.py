@@ -1381,7 +1381,7 @@ class TrayApp:
         self.app: PulseMeterApp = app
         self.icon = pystray.Icon(
             "PulseMeter",
-            Image.open(ROOT / "icon.png"),
+            Image.open(ROOT / "assets" / "icon.ico"),
             "PulseMeter",
             menu=pystray.Menu(
                 pystray.MenuItem("Show", self.show_window, default=True),
@@ -1415,6 +1415,12 @@ if __name__ == "__main__":
             time.sleep(1)
     else:
         root = tk.Tk()
+        # Set the window title-bar / taskbar icon
+        try:
+            icon_path = ROOT / "assets" / "icon.ico"
+            root.iconbitmap(str(icon_path))
+        except Exception:
+            pass
 
         app = PulseMeterApp(root)
         tray = TrayApp(root, app)
