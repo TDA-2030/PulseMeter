@@ -1,5 +1,27 @@
 import json
+import os
+import platform
 from pathlib import Path
+
+APP_NAME = "PulseMeter"
+
+
+def _config_dir() -> Path:
+    """Return the platform-appropriate user config directory for this app.
+
+    Windows : %APPDATA%\\PulseMeter
+    macOS   : ~/Library/Application Support/PulseMeter
+    Linux   : $XDG_CONFIG_HOME/PulseMeter  (default: ~/.config/PulseMeter)
+    """
+    system = platform.system()
+    if system == "Windows":
+        base = Path(os.environ.get("APPDATA", Path.home()))
+    elif system == "Darwin":
+        base = Path.home() / "Library" / "Application Support"
+    else:
+        base = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+
+    return base / APP_NAME
 
 
 class SetItem():
@@ -19,13 +41,15 @@ class SystemSetting(SetItem):
 class Setting():
     def __init__(self) -> None:
         self.systemsetting = SystemSetting()
-        
-        self.save_filename = Path("./sys-settings.json")
+
+        config_dir = _config_dir()
+        config_dir.mkdir(parents=True, exist_ok=True)
+        self.save_filename = config_dir / "sys-settings.json"
+
         if self.save_filename.is_file():
             self.load(self.save_filename)
         else:
-            # save a default settings
-            print("Can't find settings file, save a default settings")
+            print(f"Can't find settings file, save a default settings to {self.save_filename}")
             self.save(self.save_filename)
 
 
@@ -50,7 +74,7 @@ class Setting():
         except FileNotFoundError:
             print(f'File "{path}" not found')
             return False
-        
+
         for k, v in js["systemsetting"].items():
             if k != "server_ip":
                 setattr(self.systemsetting, k, v)
@@ -59,4 +83,5 @@ class Setting():
 
 if __name__ == "__main__":
     s = Setting()
+    print(f"Config path: {s.save_filename}")
     print(s.systemsetting.__dict__)
