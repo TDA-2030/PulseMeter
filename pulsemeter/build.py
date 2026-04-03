@@ -120,7 +120,6 @@ def _exclude_args() -> List[str]:
         'numpy.random',
         'numpy.polynomial',
         'numpy.ma',
-        'numpy.matrixlib',
         # test frameworks
         'unittest',
         '_pytest',

@@ -28,7 +28,7 @@ _hidden += [
 _excludes = [
     # numpy internals not needed at runtime
     'numpy.testing', 'numpy.distutils', 'numpy.f2py',
-    'numpy.random', 'numpy.polynomial', 'numpy.ma', 'numpy.matrixlib',
+    'numpy.random', 'numpy.polynomial', 'numpy.ma',
     # test frameworks
     'unittest', '_pytest', 'pytest', 'doctest',
     # dev / documentation tools
