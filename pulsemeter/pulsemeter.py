@@ -638,8 +638,8 @@ class DataCollector:
         # Bass band: kick drum + bass guitar (60–300 Hz).
         # Zeroing everything outside this range in the FFT removes cymbals,
         # vocals and high-frequency noise that obscure the rhythmic beat signal.
-        FREQ_LOW  = 60    # Hz — below this is rumble/DC
-        FREQ_HIGH = 300   # Hz — above this is mids/highs
+        FREQ_LOW  = 200    # Hz — below this is rumble/DC
+        FREQ_HIGH = 2000   # Hz — above this is mids/highs
 
         try:
             with self._mic.recorder(samplerate=samplerate, channels=1) as rec:
@@ -648,11 +648,16 @@ class DataCollector:
                     if buf.size == 0:
                         continue
 
+                    # Apply a Hamming window before the FFT to reduce spectral leakage.
+                    window = np.hamming(len(buf))
+                    window_rms = np.sqrt(np.mean(np.square(window))) or 1.0
+                    buf_win = (buf * window) / window_rms
+
                     # FFT band-pass: keep only FREQ_LOW ~ FREQ_HIGH
-                    spectrum = np.fft.rfft(buf)
-                    freqs    = np.fft.rfftfreq(len(buf), d=1.0 / samplerate)
+                    spectrum = np.fft.rfft(buf_win)
+                    freqs    = np.fft.rfftfreq(len(buf_win), d=1.0 / samplerate)
                     spectrum[(freqs < FREQ_LOW) | (freqs > FREQ_HIGH)] = 0
-                    bass     = np.fft.irfft(spectrum, len(buf))
+                    bass     = np.fft.irfft(spectrum, len(buf_win))
 
                     rms = np.sqrt(np.mean(np.square(bass))) * self._audio_gain
                     if rms > 1e-6:
@@ -774,7 +779,7 @@ class MeterManager:
                 self.sender.send_data(100, 100)
             else:
                 pct1, pct2 = self._to_pct(data1), self._to_pct(data2)
-                print(f"[CPU] Sending data: {pct1}, {pct2}")
+                # print(f"[CPU] Sending data: {pct1}, {pct2}")
                 self.sender.send_data(pct1, pct2)
             if self.extra_display_callback:
                 self.extra_display_callback(data1, data2)
@@ -919,7 +924,7 @@ class _ProgressBar(tk.Canvas):
 
 class SettingsWindow:
     """
-    Modal settings popup with two sections:
+    Modal settings popup with three sections:
       CONNECTION  — IP combo, mDNS scan, connect/disconnect
       CALIBRATION — per-meter max_duty read/write
 
@@ -931,9 +936,13 @@ class SettingsWindow:
         self._manager  = app.manager
         self._max_duty = app._max_duty
 
+        parent.update_idletasks()
+        parent_x = parent.winfo_x()
+        parent_y = parent.winfo_y()
+
         win = tk.Toplevel(parent)
         win.title("Settings")
-        win.geometry("360x350")
+        win.geometry(f"360x400+{parent_x}+{parent_y}")
         win.resizable(False, False)
         win.configure(bg=THEME['bg'])
         win.transient(parent)
@@ -983,17 +992,48 @@ class SettingsWindow:
         tk.Frame(body, bg=THEME['border'], height=1).grid(
             row=2, column=0, columnspan=4, sticky='ew', pady=(4, 10))
 
+        # -- Section: AUDIO --
+        tk.Label(body, text="AUDIO", bg=THEME['bg'],
+                 fg=THEME['green'], font=FONT['section']).grid(
+                     row=3, column=0, columnspan=4, sticky='w', pady=(0, 4))
+
+        tk.Label(body, text="Gain", bg=THEME['bg'],
+                 fg=THEME['subtext'], font=FONT['small']).grid(
+                     row=4, column=0, sticky='w', pady=6)
+
+        self._audio_gain_var = tk.DoubleVar(value=self._manager.setting.systemsetting.audio_gain)
+        self._audio_gain_scale = tk.Scale(
+            body, from_=0.0, to=20.0, resolution=0.1, orient='horizontal',
+            variable=self._audio_gain_var, showvalue=False, length=120,
+            bg=THEME['bg'], fg=THEME['text'], troughcolor=THEME['card'],
+            highlightthickness=0, activebackground=THEME['accent'],
+            command=self._on_audio_gain_changed)
+        self._audio_gain_scale.grid(row=4, column=1, padx=(8, 4), pady=6, sticky='ew')
+
+        self._audio_gain_value = tk.Label(
+            body, text=f"{self._audio_gain_var.get():.1f}x",
+            bg=THEME['bg'], fg=THEME['text'], font=FONT['small'])
+        self._audio_gain_value.grid(row=4, column=2, sticky='w', pady=6)
+
+        tk.Label(body, text="Level multiplier", bg=THEME['bg'],
+                 fg=THEME['border'], font=FONT['small']).grid(
+                     row=4, column=3, sticky='w', pady=6)
+
+        # -- Separator --
+        tk.Frame(body, bg=THEME['border'], height=1).grid(
+            row=5, column=0, columnspan=4, sticky='ew', pady=(4, 10))
+
         # -- Section: CALIBRATION --
         tk.Label(body, text="CALIBRATION", bg=THEME['bg'],
                  fg=THEME['accent2'], font=FONT['section']).grid(
-                     row=3, column=0, columnspan=3, sticky='w', pady=(0, 4))
+                     row=6, column=0, columnspan=3, sticky='w', pady=(0, 4))
 
         self._calib_btn = _HoverButton(
             body, text="▶ Cal", bg=THEME['card'], hover_bg=THEME['border'],
             fg=THEME['accent2'], font=FONT['small'],
             relief='flat', cursor='hand2', width=7, padx=2,
             command=self._toggle_calibrate)
-        self._calib_btn.grid(row=3, column=3, pady=(0, 4))
+        self._calib_btn.grid(row=6, column=3, pady=(0, 4))
         self._refresh_calib_btn()
 
         for idx, (default, name) in enumerate([
@@ -1002,39 +1042,29 @@ class SettingsWindow:
         ]):
             tk.Label(body, text=name, bg=THEME['bg'],
                      fg=THEME['subtext'], font=FONT['small']).grid(
-                         row=4 + idx, column=0, sticky='w', pady=6)
+                         row=7 + idx, column=0, sticky='w', pady=6)
 
             spin = ttk.Spinbox(body, from_=1, to=4095, increment=1,
                                width=7, style='Dark.TSpinbox')
             spin.set(default)
-            spin.grid(row=4 + idx, column=1, padx=(8, 4), pady=6)
+            spin.grid(row=7 + idx, column=1, padx=(8, 4), pady=6)
 
             btn_r = _HoverButton(body, text="R", width=2,
                                  bg=THEME['card'], fg=THEME['accent'],
                                  font=FONT['small'], relief='flat', cursor='hand2',
                                  command=lambda i=idx+1, s=spin: self._read_duty(i, s))
-            btn_r.grid(row=4 + idx, column=2, padx=2)
+            btn_r.grid(row=7 + idx, column=2, padx=2)
 
             btn_w = _HoverButton(body, text="W", width=2,
                                  bg=THEME['card'], fg=THEME['accent2'],
                                  font=FONT['small'], relief='flat', cursor='hand2',
                                  command=lambda i=idx+1, s=spin: self._write_duty(i, s))
-            btn_w.grid(row=4 + idx, column=3, padx=2)
+            btn_w.grid(row=7 + idx, column=3, padx=2)
 
             if idx == 0:
                 self._spin1, self._btn1_r, self._btn1_w = spin, btn_r, btn_w
             else:
                 self._spin2, self._btn2_r, self._btn2_w = spin, btn_r, btn_w
-
-        tk.Label(body, text="Audio gain", bg=THEME['bg'],
-                 fg=THEME['subtext'], font=FONT['small']).grid(
-                     row=6, column=0, sticky='w', pady=(10, 6))
-
-        self._audio_gain_spin = ttk.Spinbox(
-            body, from_=0.0, to=20.0, increment=0.1,
-            width=7, style='Dark.TSpinbox')
-        self._audio_gain_spin.set(self._manager.setting.systemsetting.audio_gain)
-        self._audio_gain_spin.grid(row=6, column=1, padx=(8, 4), pady=(10, 6), sticky='w')
 
         body.grid_columnconfigure(1, weight=1)
 
@@ -1107,6 +1137,12 @@ class SettingsWindow:
         self._ip_combo['values'] = []
         self._app._rescan_devices()
 
+    def _on_audio_gain_changed(self, value: str):
+        gain = round(float(value), 2)
+        self._audio_gain_value.config(text=f"{gain:.1f}x")
+        self._manager.setting.systemsetting.audio_gain = gain
+        self._manager.collector.set_audio_gain(gain)
+
     def _on_close(self):
         """Persist settings edited in the dialog before closing."""
         # Leave calibration mode when the window is dismissed
@@ -1117,7 +1153,7 @@ class SettingsWindow:
             except ValueError:
                 pass
         try:
-            gain = max(0.0, float(self._audio_gain_spin.get()))
+            gain = max(0.0, float(self._audio_gain_var.get()))
         except ValueError:
             gain = self._manager.setting.systemsetting.audio_gain
         self._manager.setting.systemsetting.audio_gain = round(gain, 2)
