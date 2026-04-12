@@ -8,10 +8,11 @@ import subprocess
 import threading
 import socket
 import struct
+import ipaddress
+import concurrent.futures
 import psutil
 import numpy as np
 import soundcard as sc
-import sys
 import traceback
 import pystray
 from PIL import Image
@@ -293,14 +294,14 @@ class DataSender:
     # Connection management
     # ------------------------------------------------------------------
 
-    def connect(self, host: str, port: int) -> bool:
+    def connect(self, host: str, port: int, timeout: float = 2.0) -> bool:
         self.host = host
         self.port = port
         try:
             print(f"[TCP] Connecting to {host}:{port}")
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            self.sock.settimeout(2)
+            self.sock.settimeout(timeout)
             self.sock.connect((host, port))
             self.sock.settimeout(None)  # blocking mode for recv thread
             self._stop_recv.clear()
@@ -474,6 +475,77 @@ class DataSender:
                     print(f"[TCP] Recv: no pending request for seq={seq}")
 
 
+class SubnetDeviceScanner:
+    """Fallback LAN scanner for PulseMeter devices when mDNS finds nothing."""
+
+    def __init__(self, port: int = 5000, connect_timeout: float = 0.25,
+                 read_timeout: float = 0.5, max_hosts: int = 256,
+                 max_workers: int = 64):
+        self.port = port
+        self.connect_timeout = connect_timeout
+        self.read_timeout = read_timeout
+        self.max_hosts = max_hosts
+        self.max_workers = max_workers
+        self.on_progress = None
+
+    def scan(self) -> list[str]:
+        candidates: list[str] = []
+        for network in self._scan_networks():
+            candidates.extend(str(ip) for ip in network.hosts())
+        candidates = list(dict.fromkeys(candidates))
+        print(f"[DISCOVERY] Scanning {len(candidates)} host(s)")
+        if self.on_progress:
+            self.on_progress(f"Scanning subnet: {len(candidates)} hosts")
+        if not candidates:
+            return []
+
+        found: list[str] = []
+        workers = min(self.max_workers, max(8, len(candidates)))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+            future_map = {pool.submit(self._probe_host, host): host for host in candidates}
+            for future in concurrent.futures.as_completed(future_map):
+                host = future_map[future]
+                try:
+                    if future.result():
+                        found.append(host)
+                        print(f"[DISCOVERY] Scan found PulseMeter @ {host}")
+                        if self.on_progress:
+                            self.on_progress(f"Found device: {host}")
+                except Exception as e:
+                    print(f"[DISCOVERY] Scan probe failed for {host}: {e}")
+        return found
+
+    def _scan_networks(self) -> list[ipaddress.IPv4Network]:
+        networks: list[ipaddress.IPv4Network] = []
+        stats = psutil.net_if_stats()
+        for if_name, addrs in psutil.net_if_addrs().items():
+            if if_name not in stats or not stats[if_name].isup:
+                continue
+            for addr in addrs:
+                if addr.family != socket.AF_INET or not addr.address or not addr.netmask:
+                    continue
+                if addr.address.startswith("127.") or addr.address.startswith("169.254."):
+                    continue
+                try:
+                    network = ipaddress.ip_network(
+                        f"{addr.address}/{addr.netmask}", strict=False)
+                except ValueError:
+                    continue
+                if network.num_addresses > self.max_hosts:
+                    network = ipaddress.ip_network(f"{addr.address}/24", strict=False)
+                networks.append(network)
+        return list(dict.fromkeys(networks))
+
+    def _probe_host(self, host: str) -> bool:
+        sender = DataSender()
+        try:
+            if not sender.connect(host, self.port, timeout=self.connect_timeout):
+                return False
+            return sender.read_param(Protocol.PARAM_MODE, timeout=self.read_timeout) is not None
+        finally:
+            sender.close()
+
+
 # Metric display labels — BMP-only Unicode symbols render on all platforms and fonts.
 # Raw keys are used everywhere internally; labels appear only in the UI comboboxes.
 METRIC_LABELS = {
@@ -501,6 +573,7 @@ class DataCollector:
         # Audio is sampled in a dedicated thread to avoid blocking the main loop.
         # The recorder is kept open permanently to eliminate per-iteration open overhead.
         self._audio_level: float = 0.0
+        self._audio_gain: float = 1.0
         self._audio_stop = threading.Event()
         self._audio_thread: threading.Thread | None = None
         # Cache of the last non-audio data frame.  Written by _run() at 0.5 s;
@@ -511,6 +584,12 @@ class DataCollector:
     def get_available_metrics(self):
         # Returns display labels (with icons); use METRIC_KEYS to convert back to raw keys.
         return list(METRIC_LABELS.values())
+
+    def set_audio_gain(self, gain: float):
+        try:
+            self._audio_gain = max(0.0, float(gain))
+        except (TypeError, ValueError):
+            self._audio_gain = 1.0
 
     def start(self, interval=1.0, metrics=None, callback=None):
         self.interval = interval
@@ -575,7 +654,7 @@ class DataCollector:
                     spectrum[(freqs < FREQ_LOW) | (freqs > FREQ_HIGH)] = 0
                     bass     = np.fft.irfft(spectrum, len(buf))
 
-                    rms = np.sqrt(np.mean(np.square(bass)))
+                    rms = np.sqrt(np.mean(np.square(bass))) * self._audio_gain
                     if rms > 1e-6:
                         # dB scale: [-60 dB, 0 dB] → [0, 100]
                         db = 20 * np.log10(rms)
@@ -703,16 +782,24 @@ class MeterManager:
             print(f"[CPU] Loop error: {e}")
             traceback.print_exc()
 
-    def start(self):
+    def start(self) -> bool:
         metrics = [self.setting.systemsetting.meter1, self.setting.systemsetting.meter2]
         # All metrics use a 0.5 s collection interval.  Audio is sampled by its
         # own dedicated thread at _AUDIO_CHUNK_S (50 ms) and exposed via
         # _audio_level, so the main loop just does a non-blocking read.
         interval = 0.5
-        print("[APP] Starting MeterManager", self.setting.systemsetting.__dict__, f"interval={interval}")
+        self.collector.set_audio_gain(self.setting.systemsetting.audio_gain)
+        print("[APP] Starting MeterManager", self.setting.systemsetting.__dict__)
+        if not self.sender.connect(self.setting.systemsetting.server_ip, 5000):
+            self.sender.close()
+            return False
+        if self.sender.read_param(Protocol.PARAM_MODE, timeout=1.0) is None:
+            print("[APP] Device protocol validation failed")
+            self.sender.close()
+            return False
         self.collector.start(interval, metrics=metrics, callback=self.data_cb)
-        self.sender.connect(self.setting.systemsetting.server_ip, 5000)
         self.is_running = True
+        return True
 
     def start_calibration(self):
         """Override data output with 100/100 so needles sweep to full scale."""
@@ -736,6 +823,7 @@ class MeterManager:
         self.collector.stop()
         self.setting.systemsetting.meter1 = meter1
         self.setting.systemsetting.meter2 = meter2
+        self.collector.set_audio_gain(self.setting.systemsetting.audio_gain)
         metrics  = [meter1, meter2]
         interval = 0.5  # audio is handled by its own thread; main loop stays at 0.5 s
         print(f"[APP] Restarting collector: {meter1}, {meter2}  interval={interval}")
@@ -845,7 +933,7 @@ class SettingsWindow:
 
         win = tk.Toplevel(parent)
         win.title("Settings")
-        win.geometry("360x300")
+        win.geometry("360x350")
         win.resizable(False, False)
         win.configure(bg=THEME['bg'])
         win.transient(parent)
@@ -938,6 +1026,16 @@ class SettingsWindow:
             else:
                 self._spin2, self._btn2_r, self._btn2_w = spin, btn_r, btn_w
 
+        tk.Label(body, text="Audio gain", bg=THEME['bg'],
+                 fg=THEME['subtext'], font=FONT['small']).grid(
+                     row=6, column=0, sticky='w', pady=(10, 6))
+
+        self._audio_gain_spin = ttk.Spinbox(
+            body, from_=0.0, to=20.0, increment=0.1,
+            width=7, style='Dark.TSpinbox')
+        self._audio_gain_spin.set(self._manager.setting.systemsetting.audio_gain)
+        self._audio_gain_spin.grid(row=6, column=1, padx=(8, 4), pady=(10, 6), sticky='w')
+
         body.grid_columnconfigure(1, weight=1)
 
         # --- Footer ---
@@ -976,9 +1074,11 @@ class SettingsWindow:
     # ------------------------------------------------------------------
 
     def _toggle_connect(self):
-        """Write the selected IP to settings then delegate to app.toggle_start()."""
-        self._app.manager.setting.systemsetting.server_ip = self._ip_combo.get()
-        self._app.toggle_start()
+        """Connect to the entered host, or disconnect if already running."""
+        if self._manager.is_running:
+            self._app.toggle_start()
+        else:
+            self._app._connect_to_host(self._ip_combo.get(), source="manual")
 
     def _toggle_calibrate(self):
         """Start or stop calibration mode (sends 100/100 to drive needles to max)."""
@@ -1008,7 +1108,7 @@ class SettingsWindow:
         self._app._rescan_devices()
 
     def _on_close(self):
-        """Persist max_duty values back to shared list before closing."""
+        """Persist settings edited in the dialog before closing."""
         # Leave calibration mode when the window is dismissed
         self._manager.stop_calibration()
         for i, spin in enumerate([self._spin1, self._spin2]):
@@ -1016,6 +1116,13 @@ class SettingsWindow:
                 self._max_duty[i] = int(float(spin.get()))
             except ValueError:
                 pass
+        try:
+            gain = max(0.0, float(self._audio_gain_spin.get()))
+        except ValueError:
+            gain = self._manager.setting.systemsetting.audio_gain
+        self._manager.setting.systemsetting.audio_gain = round(gain, 2)
+        self._manager.collector.set_audio_gain(self._manager.setting.systemsetting.audio_gain)
+        self._manager.setting.save(self._manager.setting.save_filename)
         self._app._settings_win = None
         self.win.destroy()
 
@@ -1076,6 +1183,10 @@ class PulseMeterApp:
         self._max_duty       = [448, 236]   # shared with SettingsWindow
         self._discovered_ips: list = []     # filled by mDNS, read by SettingsWindow
         self._settings_win   = None         # track open SettingsWindow instance
+        self._connect_lock   = threading.Lock()
+        self._connecting     = False
+        self._scan_after_id  = None
+        self._scan_token     = 0
 
         self._configure_styles()
         self._build_ui()
@@ -1083,7 +1194,12 @@ class PulseMeterApp:
         # mDNS device discovery
         self.discovery = DeviceDiscovery()
         self.discovery.on_change = self._on_devices_changed
+        self.subnet_scanner = SubnetDeviceScanner()
+        self.subnet_scanner.on_progress = self._on_scan_progress
         self.discovery.start()
+        self._set_hint_status("Discovering devices...", THEME['yellow'])
+        self._schedule_fallback_scan()
+        self._auto_connect_saved_ip()
 
     # ------------------------------------------------------------------
     # Style setup
@@ -1231,6 +1347,15 @@ class PulseMeterApp:
     # Event handlers
     # ------------------------------------------------------------------
 
+    def _set_hint_status(self, text: str, color: str | None = None):
+        try:
+            self._hint.config(text=text, fg=color or THEME['border'])
+        except tk.TclError:
+            pass
+
+    def _on_scan_progress(self, message: str):
+        self.root.after(0, lambda: self._set_hint_status(message, THEME['yellow']))
+
     def _open_settings(self):
         """Open settings window; bring existing one to front if already open."""
         if self._settings_win is not None:
@@ -1241,31 +1366,137 @@ class PulseMeterApp:
                 self._settings_win = None
         self._settings_win = SettingsWindow(self.root, self)
 
+    def _set_connecting(self, connecting: bool):
+        with self._connect_lock:
+            self._connecting = connecting
+
+    def _is_connecting(self) -> bool:
+        with self._connect_lock:
+            return self._connecting
+
+    def _refresh_ip_targets(self, ips: list[str]):
+        def sort_key(ip: str):
+            try:
+                return (0, int(ipaddress.ip_address(ip)))
+            except ValueError:
+                return (1, ip)
+
+        merged = sorted({*(self._discovered_ips or []), *(ips or [])},
+                        key=sort_key)
+        self._discovered_ips = merged
+        if self._settings_win is not None:
+            try:
+                self._settings_win.refresh_ip_list(merged)
+            except tk.TclError:
+                self._settings_win = None
+
+    def _connect_to_host(self, host: str, source: str):
+        host = (host or "").strip()
+        if not host:
+            return
+        if self.manager.is_running or self._is_connecting():
+            return
+
+        meter1 = METRIC_KEYS.get(self.combo1.get(), self.combo1.get())
+        meter2 = METRIC_KEYS.get(self.combo2.get(), self.combo2.get())
+        self.manager.setting.systemsetting.server_ip = host
+        self.manager.setting.systemsetting.meter1 = meter1
+        self.manager.setting.systemsetting.meter2 = meter2
+        self._set_connecting(True)
+        self._set_hint_status(f"Connecting to {host}...", THEME['yellow'])
+
+        def do_connect():
+            ok = self.manager.start()
+
+            def done():
+                self._set_connecting(False)
+                if ok:
+                    self.manager.setting.save(self.manager.setting.save_filename)
+                    self.manager.set_extra_display_callback(self.update_meter_label)
+                    self._set_connected(True)
+                    self._refresh_ip_targets([host])
+                    self._set_hint_status(f"Connected: {host}", THEME['green'])
+                    print(f"[APP] connected via {source}: {host}")
+                else:
+                    self.manager.set_extra_display_callback(None)
+                    self._set_connected(False)
+                    self._set_hint_status(f"Connect failed: {host}", THEME['red'])
+                    print(f"[APP] connect failed via {source}: {host}")
+                    if source != "manual" and not self._discovered_ips:
+                        self._schedule_fallback_scan(delay_ms=500)
+
+            self.root.after(0, done)
+
+        threading.Thread(target=do_connect, daemon=True,
+                         name=f"Connect-{source}").start()
+
+    def _auto_connect_saved_ip(self):
+        saved_ip = (self.manager.setting.systemsetting.server_ip or "").strip()
+        if saved_ip:
+            print(f"[APP] Trying saved IP {saved_ip}")
+            self._connect_to_host(saved_ip, source="saved-ip")
+
+    def _schedule_fallback_scan(self, delay_ms: int = 3000):
+        self._scan_token += 1
+        token = self._scan_token
+        if self._scan_after_id is not None:
+            try:
+                self.root.after_cancel(self._scan_after_id)
+            except tk.TclError:
+                pass
+        self._scan_after_id = self.root.after(delay_ms, lambda: self._maybe_start_fallback_scan(token))
+
+    def _maybe_start_fallback_scan(self, token: int):
+        self._scan_after_id = None
+        if token != self._scan_token or self.manager.is_running or self._is_connecting():
+            return
+        if self._discovered_ips:
+            return
+        print("[DISCOVERY] mDNS empty, starting subnet scan")
+        self._set_hint_status("mDNS not found, scanning subnet...", THEME['yellow'])
+        threading.Thread(target=self._fallback_scan_worker,
+                         args=(token,), daemon=True, name="SubnetScan").start()
+
+    def _fallback_scan_worker(self, token: int):
+        found = self.subnet_scanner.scan()
+
+        def done():
+            if token != self._scan_token or self.manager.is_running:
+                return
+            self._refresh_ip_targets(found)
+            if len(found) == 1:
+                self._set_hint_status(f"Scan found device: {found[0]}", THEME['green'])
+                self._connect_to_host(found[0], source="subnet-scan")
+            elif len(found) > 1:
+                self._set_hint_status(f"Scan found {len(found)} devices", THEME['yellow'])
+            else:
+                self._set_hint_status("No devices found", THEME['red'])
+
+        self.root.after(0, done)
+
     def _on_devices_changed(self):
         """Called from the mDNS worker thread — marshal update to main thread."""
         devices = self.discovery.get_devices()
         ips     = [ip for _, ip in devices]
 
         def update():
-            self._discovered_ips = ips
-            # Refresh IP combo inside settings window if it is open
-            if self._settings_win is not None:
-                try:
-                    self._settings_win.refresh_ip_list(ips)
-                except tk.TclError:
-                    self._settings_win = None
+            self._refresh_ip_targets(ips)
+            if ips and not self.manager.is_running and not self._is_connecting():
+                self._set_hint_status(f"mDNS found {len(ips)} device(s)", THEME['yellow'])
             # Auto-connect when exactly one device is on the network
             if len(ips) == 1 and not self.manager.is_running:
                 print(f"[mDNS] Single device @ {ips[0]} — auto-connecting")
-                self.manager.setting.systemsetting.server_ip = ips[0]
-                self.toggle_start()
+                self._set_hint_status(f"mDNS found device: {ips[0]}", THEME['green'])
+                self._connect_to_host(ips[0], source="mdns")
 
         self.root.after(0, update)
 
     def _rescan_devices(self):
         """Restart mDNS discovery and clear stale device list."""
         self._discovered_ips = []
+        self._set_hint_status("Rescanning devices...", THEME['yellow'])
         self.discovery.start()
+        self._schedule_fallback_scan()
 
     @staticmethod
     def _fmt(v) -> tuple:
@@ -1363,16 +1594,7 @@ class PulseMeterApp:
             self._set_connected(False)
             print("[APP] stopped")
         else:
-            # server_ip is already written by SettingsWindow._toggle_connect
-            # or by _on_devices_changed (auto-connect); just sync the metric choice.
-            # Combo shows display labels; convert back to raw keys for internal use.
-            self.manager.setting.systemsetting.meter1 = METRIC_KEYS.get(self.combo1.get(), self.combo1.get())
-            self.manager.setting.systemsetting.meter2 = METRIC_KEYS.get(self.combo2.get(), self.combo2.get())
-            self.manager.setting.save(self.manager.setting.save_filename)
-            self.manager.start()
-            self.manager.set_extra_display_callback(self.update_meter_label)
-            self._set_connected(True)
-            print("[APP] started")
+            self._connect_to_host(self.manager.setting.systemsetting.server_ip, source="manual")
 
 
 class TrayApp:
@@ -1408,21 +1630,15 @@ class TrayApp:
 
 
 if __name__ == "__main__":
-    if "--no-gui" in sys.argv:
-        manager = MeterManager()
-        manager.start()
-        while True:
-            time.sleep(1)
-    else:
-        root = tk.Tk()
-        # Set the window title-bar / taskbar icon
-        try:
-            icon_path = ROOT / "assets" / "icon.ico"
-            root.iconbitmap(str(icon_path))
-        except Exception:
-            pass
+    root = tk.Tk()
+    # Set the window title-bar / taskbar icon
+    try:
+        icon_path = ROOT / "assets" / "icon.ico"
+        root.iconbitmap(str(icon_path))
+    except Exception:
+        pass
 
-        app = PulseMeterApp(root)
-        tray = TrayApp(root, app)
-        tray.run()
-        root.mainloop()
+    app = PulseMeterApp(root)
+    tray = TrayApp(root, app)
+    tray.run()
+    root.mainloop()

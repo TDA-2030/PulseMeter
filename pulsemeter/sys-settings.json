@@ -4,6 +4,8 @@
     "interval": 0.02,
     "meter1": "cpu",
     "meter2": "memory",
-    "net_dev": "eth0"
+    "audio_gain": 1.0,
+    "net_dev": "eth0",
+    "server_ip": ""
   }
 }

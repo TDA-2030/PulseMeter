@@ -34,6 +34,7 @@ class SystemSetting(SetItem):
         self.interval = 0.6
         self.meter1 = "cpu"
         self.meter2 = "cpu"
+        self.audio_gain = 1.0
         self.net_dev = "eth0"
         self.server_ip = ""
 
@@ -56,7 +57,7 @@ class Setting():
     def save(self, path: str) -> bool:
         if isinstance(path, Path):
             path = str(path)
-        ss = {k: v for k, v in self.systemsetting.__dict__.items() if k != "server_ip"}
+        ss = dict(self.systemsetting.__dict__)
         mate = {"systemsetting": ss}
         jsonString = json.dumps(mate, indent=2, ensure_ascii=True)
         with open(path, "w") as f:
@@ -76,8 +77,7 @@ class Setting():
             return False
 
         for k, v in js["systemsetting"].items():
-            if k != "server_ip":
-                setattr(self.systemsetting, k, v)
+            setattr(self.systemsetting, k, v)
 
         return True
 
