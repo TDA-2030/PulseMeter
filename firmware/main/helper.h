@@ -10,7 +10,7 @@ extern "C" {
 
 #define __HERE() printf("%s:%d - %s\n", __FILE__, __LINE__, __func__)
 
-#define RESTART_COUNT_RESET 6
+#define RESTART_COUNT_RESET 5
 
 esp_err_t iot_param_save(const char* space_name, const char* key, void *param, uint16_t len);
 

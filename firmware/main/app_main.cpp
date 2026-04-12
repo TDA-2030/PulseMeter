@@ -39,6 +39,7 @@ extern "C" void app_main()
     ESP_LOGI(TAG, "Restart count=[%d]", restart_cnt);
     if (restart_cnt >= RESTART_COUNT_RESET) {
         ESP_LOGW(TAG, "Erase information saved in flash and restart");
+        ESP_ERROR_CHECK(nvs_flash_erase());
     }
     meters[0].init(BOARD_IO_METER1);
     meters[1].init(BOARD_IO_METER2);
