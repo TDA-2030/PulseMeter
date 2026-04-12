@@ -556,6 +556,9 @@ METRIC_LABELS = {
     'net_up':        '🔼 Net Up',
     'net_down':      '🔽 Net Down',
     'audio':         '🎵 Audio',
+    'time_hour':     '🕐 Hour',
+    'time_minute':   '⏱ Minute',
+    'time_second':   '⏲ Second',
 }
 METRIC_KEYS = {v: k for k, v in METRIC_LABELS.items()}
 
@@ -737,6 +740,14 @@ class DataCollector:
                 key = "net_up" if "net_up" in metrics else "net_down"
                 data[key] = {"MB/s": round((up_speed if key == "net_up" else down_speed) / (1024 * 1024), 2)}
                 self._prev_net = net
+            if any(m in metrics for m in ("time_hour", "time_minute", "time_second")):
+                now = time.localtime()
+                if "time_hour" in metrics:
+                    data["time_hour"] = now.tm_hour
+                if "time_minute" in metrics:
+                    data["time_minute"] = now.tm_min
+                if "time_second" in metrics:
+                    data["time_second"] = now.tm_sec
             if "audio" in metrics:
                 # When audio is active the _audio_loop drives the callback at
                 # _AUDIO_CHUNK_S rate.  Here we only refresh the non-audio cache
@@ -758,7 +769,7 @@ class DataCollector:
             next_deadline += interval
 
 
-# -------------------- 仪表管理类 --------------------
+# -------------------- 浠〃绠＄悊绫?--------------------
 class MeterManager:
     def __init__(self):
         self.sender = DataSender()
@@ -769,11 +780,20 @@ class MeterManager:
         self._calibrating = False   # when True, override output with 100/100
 
     @staticmethod
-    def _to_pct(v) -> int:
-        """Convert a raw metric value to a 0–100 integer suitable for the TCP frame.
-        Numeric values are clamped; MB/s dicts are scaled (5 MB/s → 100)."""
+    def _to_pct(metric: str, v) -> int:
+        """Convert a raw metric value to a 0-100 integer suitable for the TCP frame."""
         if isinstance(v, dict):
             return int(min(v.get('MB/s', 0.0) * 20.0, 100.0))
+        if metric == "time_hour":
+            try:
+                return int(min(max(float(v), 0.0) / 23.0 * 100.0, 100.0))
+            except (TypeError, ValueError):
+                return 0
+        if metric in ("time_minute", "time_second"):
+            try:
+                return int(min(max(float(v), 0.0) / 59.0 * 100.0, 100.0))
+            except (TypeError, ValueError):
+                return 0
         try:
             return max(0, min(100, int(float(v))))
         except (TypeError, ValueError):
@@ -793,7 +813,8 @@ class MeterManager:
                 # Send full-scale values so the needle visually reaches max_duty
                 self.sender.send_data(100, 100)
             else:
-                pct1, pct2 = self._to_pct(data1), self._to_pct(data2)
+                pct1 = self._to_pct(metrics[0], data1)
+                pct2 = self._to_pct(metrics[1], data2)
                 # print(f"[CPU] Sending data: {pct1}, {pct2}")
                 self.sender.send_data(pct1, pct2)
             if self.extra_display_callback:
@@ -1631,11 +1652,29 @@ class PulseMeterApp:
         self._schedule_fallback_scan()
 
     @staticmethod
-    def _fmt(v) -> tuple:
-        """Return (display_str, unit_str, progress_pct 0–100) for a raw metric value."""
+    def _fmt(metric: str, v) -> tuple:
+        """Return (display_str, unit_str, progress_pct 0-100) for a raw metric value."""
         if isinstance(v, dict):
             mb = v.get('MB/s', 0.0)
             return f"{mb:.1f}", "MB/s", min(mb * 20.0, 100.0)
+        if metric == "time_hour":
+            try:
+                f = float(v)
+                return f"{f:.0f}", "h", min(max(f, 0.0) / 23.0 * 100.0, 100.0)
+            except (TypeError, ValueError):
+                return "-", "", 0.0
+        if metric == "time_minute":
+            try:
+                f = float(v)
+                return f"{f:.0f}", "min", min(max(f, 0.0) / 59.0 * 100.0, 100.0)
+            except (TypeError, ValueError):
+                return "-", "", 0.0
+        if metric == "time_second":
+            try:
+                f = float(v)
+                return f"{f:.0f}", "s", min(max(f, 0.0) / 59.0 * 100.0, 100.0)
+            except (TypeError, ValueError):
+                return "-", "", 0.0
         try:
             f = float(v)
             return f"{f:.1f}", "%", f
@@ -1645,11 +1684,12 @@ class PulseMeterApp:
     def update_meter_label(self, meter1, meter2):
         """Collector thread callback — must marshal to the main thread."""
         def _update():
-            for val, lbl, unit_lbl, prog in [
-                (meter1, self._val1, self._unit1, self._prog1),
-                (meter2, self._val2, self._unit2, self._prog2),
+            metrics = self.manager.collector.metrics or ["", ""]
+            for metric, val, lbl, unit_lbl, prog in [
+                (metrics[0] if len(metrics) > 0 else "", meter1, self._val1, self._unit1, self._prog1),
+                (metrics[1] if len(metrics) > 1 else "", meter2, self._val2, self._unit2, self._prog2),
             ]:
-                text, unit, pct = self._fmt(val)
+                text, unit, pct = self._fmt(metric, val)
                 lbl.config(text=text)
                 unit_lbl.config(text=unit)
                 prog.set_value(pct)
