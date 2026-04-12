@@ -35,6 +35,8 @@ class SystemSetting(SetItem):
         self.meter1 = "cpu"
         self.meter2 = "cpu"
         self.audio_gain = 1.0
+        self.audio_freq_low = 200
+        self.audio_freq_high = 2000
         self.net_dev = "eth0"
         self.server_ip = ""
 

@@ -5,6 +5,8 @@
     "meter1": "cpu",
     "meter2": "memory",
     "audio_gain": 1.0,
+    "audio_freq_low": 200,
+    "audio_freq_high": 2000,
     "net_dev": "eth0",
     "server_ip": ""
   }

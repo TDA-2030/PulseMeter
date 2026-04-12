@@ -574,6 +574,8 @@ class DataCollector:
         # The recorder is kept open permanently to eliminate per-iteration open overhead.
         self._audio_level: float = 0.0
         self._audio_gain: float = 1.0
+        self._audio_freq_low: float = 200.0
+        self._audio_freq_high: float = 2000.0
         self._audio_stop = threading.Event()
         self._audio_thread: threading.Thread | None = None
         # Cache of the last non-audio data frame.  Written by _run() at 0.5 s;
@@ -590,6 +592,17 @@ class DataCollector:
             self._audio_gain = max(0.0, float(gain))
         except (TypeError, ValueError):
             self._audio_gain = 1.0
+
+    def set_audio_band(self, low: float, high: float):
+        try:
+            low = float(low)
+            high = float(high)
+        except (TypeError, ValueError):
+            return
+        low = max(0.0, low)
+        high = max(low + 1.0, high)
+        self._audio_freq_low = low
+        self._audio_freq_high = high
 
     def start(self, interval=1.0, metrics=None, callback=None):
         self.interval = interval
@@ -638,8 +651,8 @@ class DataCollector:
         # Bass band: kick drum + bass guitar (60–300 Hz).
         # Zeroing everything outside this range in the FFT removes cymbals,
         # vocals and high-frequency noise that obscure the rhythmic beat signal.
-        FREQ_LOW  = 200    # Hz — below this is rumble/DC
-        FREQ_HIGH = 2000   # Hz — above this is mids/highs
+        # FREQ_LOW  = 200    # Hz — below this is rumble/DC
+        # FREQ_HIGH = 2000   # Hz — above this is mids/highs
 
         try:
             with self._mic.recorder(samplerate=samplerate, channels=1) as rec:
@@ -647,6 +660,8 @@ class DataCollector:
                     buf = rec.record(numframes=chunk_frames).flatten()
                     if buf.size == 0:
                         continue
+                    freq_low = self._audio_freq_low
+                    freq_high = self._audio_freq_high
 
                     # Apply a Hamming window before the FFT to reduce spectral leakage.
                     window = np.hamming(len(buf))
@@ -656,7 +671,7 @@ class DataCollector:
                     # FFT band-pass: keep only FREQ_LOW ~ FREQ_HIGH
                     spectrum = np.fft.rfft(buf_win)
                     freqs    = np.fft.rfftfreq(len(buf_win), d=1.0 / samplerate)
-                    spectrum[(freqs < FREQ_LOW) | (freqs > FREQ_HIGH)] = 0
+                    spectrum[(freqs < freq_low) | (freqs > freq_high)] = 0
                     bass     = np.fft.irfft(spectrum, len(buf_win))
 
                     rms = np.sqrt(np.mean(np.square(bass))) * self._audio_gain
@@ -794,6 +809,10 @@ class MeterManager:
         # _audio_level, so the main loop just does a non-blocking read.
         interval = 0.5
         self.collector.set_audio_gain(self.setting.systemsetting.audio_gain)
+        self.collector.set_audio_band(
+            self.setting.systemsetting.audio_freq_low,
+            self.setting.systemsetting.audio_freq_high,
+        )
         print("[APP] Starting MeterManager", self.setting.systemsetting.__dict__)
         if not self.sender.connect(self.setting.systemsetting.server_ip, 5000):
             self.sender.close()
@@ -829,6 +848,10 @@ class MeterManager:
         self.setting.systemsetting.meter1 = meter1
         self.setting.systemsetting.meter2 = meter2
         self.collector.set_audio_gain(self.setting.systemsetting.audio_gain)
+        self.collector.set_audio_band(
+            self.setting.systemsetting.audio_freq_low,
+            self.setting.systemsetting.audio_freq_high,
+        )
         metrics  = [meter1, meter2]
         interval = 0.5  # audio is handled by its own thread; main loop stays at 0.5 s
         print(f"[APP] Restarting collector: {meter1}, {meter2}  interval={interval}")
@@ -942,7 +965,7 @@ class SettingsWindow:
 
         win = tk.Toplevel(parent)
         win.title("Settings")
-        win.geometry(f"360x400+{parent_x}+{parent_y}")
+        win.geometry(f"420x470+{parent_x}+{parent_y}")
         win.resizable(False, False)
         win.configure(bg=THEME['bg'])
         win.transient(parent)
@@ -1002,38 +1025,82 @@ class SettingsWindow:
                      row=4, column=0, sticky='w', pady=6)
 
         self._audio_gain_var = tk.DoubleVar(value=self._manager.setting.systemsetting.audio_gain)
-        self._audio_gain_scale = tk.Scale(
-            body, from_=0.0, to=20.0, resolution=0.1, orient='horizontal',
-            variable=self._audio_gain_var, showvalue=False, length=120,
-            bg=THEME['bg'], fg=THEME['text'], troughcolor=THEME['card'],
-            highlightthickness=0, activebackground=THEME['accent'],
+        self._audio_gain_scale = ttk.Scale(
+            body, from_=0.0, to=20.0,
+            variable=self._audio_gain_var, length=140,
+            style='Modern.Horizontal.TScale',
             command=self._on_audio_gain_changed)
         self._audio_gain_scale.grid(row=4, column=1, padx=(8, 4), pady=6, sticky='ew')
 
         self._audio_gain_value = tk.Label(
             body, text=f"{self._audio_gain_var.get():.1f}x",
-            bg=THEME['bg'], fg=THEME['text'], font=FONT['small'])
+            bg=THEME['card'], fg=THEME['text'], font=FONT['small'],
+            padx=8, pady=2)
         self._audio_gain_value.grid(row=4, column=2, sticky='w', pady=6)
 
         tk.Label(body, text="Level multiplier", bg=THEME['bg'],
                  fg=THEME['border'], font=FONT['small']).grid(
                      row=4, column=3, sticky='w', pady=6)
 
+        tk.Label(body, text="Low cut", bg=THEME['bg'],
+                 fg=THEME['subtext'], font=FONT['small']).grid(
+                     row=5, column=0, sticky='w', pady=6)
+
+        self._audio_low_var = tk.DoubleVar(value=self._manager.setting.systemsetting.audio_freq_low)
+        self._audio_low_scale = ttk.Scale(
+            body, from_=20.0, to=3000.0,
+            variable=self._audio_low_var, length=140,
+            style='Modern.Horizontal.TScale',
+            command=self._on_audio_low_changed)
+        self._audio_low_scale.grid(row=5, column=1, padx=(8, 4), pady=6, sticky='ew')
+
+        self._audio_low_value = tk.Label(
+            body, text=f"{self._audio_low_var.get():.0f} Hz",
+            bg=THEME['card'], fg=THEME['text'], font=FONT['small'],
+            padx=8, pady=2)
+        self._audio_low_value.grid(row=5, column=2, sticky='w', pady=6)
+
+        tk.Label(body, text="Band lower edge", bg=THEME['bg'],
+                 fg=THEME['border'], font=FONT['small']).grid(
+                     row=5, column=3, sticky='w', pady=6)
+
+        tk.Label(body, text="High cut", bg=THEME['bg'],
+                 fg=THEME['subtext'], font=FONT['small']).grid(
+                     row=6, column=0, sticky='w', pady=6)
+
+        self._audio_high_var = tk.DoubleVar(value=self._manager.setting.systemsetting.audio_freq_high)
+        self._audio_high_scale = ttk.Scale(
+            body, from_=20.0, to=3000.0,
+            variable=self._audio_high_var, length=140,
+            style='Modern.Horizontal.TScale',
+            command=self._on_audio_high_changed)
+        self._audio_high_scale.grid(row=6, column=1, padx=(8, 4), pady=6, sticky='ew')
+
+        self._audio_high_value = tk.Label(
+            body, text=f"{self._audio_high_var.get():.0f} Hz",
+            bg=THEME['card'], fg=THEME['text'], font=FONT['small'],
+            padx=8, pady=2)
+        self._audio_high_value.grid(row=6, column=2, sticky='w', pady=6)
+
+        tk.Label(body, text="Band upper edge", bg=THEME['bg'],
+                 fg=THEME['border'], font=FONT['small']).grid(
+                     row=6, column=3, sticky='w', pady=6)
+
         # -- Separator --
         tk.Frame(body, bg=THEME['border'], height=1).grid(
-            row=5, column=0, columnspan=4, sticky='ew', pady=(4, 10))
+            row=7, column=0, columnspan=4, sticky='ew', pady=(4, 10))
 
         # -- Section: CALIBRATION --
         tk.Label(body, text="CALIBRATION", bg=THEME['bg'],
                  fg=THEME['accent2'], font=FONT['section']).grid(
-                     row=6, column=0, columnspan=3, sticky='w', pady=(0, 4))
+                     row=8, column=0, columnspan=3, sticky='w', pady=(0, 4))
 
         self._calib_btn = _HoverButton(
-            body, text="▶ Cal", bg=THEME['card'], hover_bg=THEME['border'],
+            body, text="鈻?Cal", bg=THEME['card'], hover_bg=THEME['border'],
             fg=THEME['accent2'], font=FONT['small'],
             relief='flat', cursor='hand2', width=7, padx=2,
             command=self._toggle_calibrate)
-        self._calib_btn.grid(row=6, column=3, pady=(0, 4))
+        self._calib_btn.grid(row=8, column=3, pady=(0, 4))
         self._refresh_calib_btn()
 
         for idx, (default, name) in enumerate([
@@ -1042,24 +1109,24 @@ class SettingsWindow:
         ]):
             tk.Label(body, text=name, bg=THEME['bg'],
                      fg=THEME['subtext'], font=FONT['small']).grid(
-                         row=7 + idx, column=0, sticky='w', pady=6)
+                         row=9 + idx, column=0, sticky='w', pady=6)
 
             spin = ttk.Spinbox(body, from_=1, to=4095, increment=1,
                                width=7, style='Dark.TSpinbox')
             spin.set(default)
-            spin.grid(row=7 + idx, column=1, padx=(8, 4), pady=6)
+            spin.grid(row=9 + idx, column=1, padx=(8, 4), pady=6)
 
             btn_r = _HoverButton(body, text="R", width=2,
                                  bg=THEME['card'], fg=THEME['accent'],
                                  font=FONT['small'], relief='flat', cursor='hand2',
                                  command=lambda i=idx+1, s=spin: self._read_duty(i, s))
-            btn_r.grid(row=7 + idx, column=2, padx=2)
+            btn_r.grid(row=9 + idx, column=2, padx=2)
 
             btn_w = _HoverButton(body, text="W", width=2,
                                  bg=THEME['card'], fg=THEME['accent2'],
                                  font=FONT['small'], relief='flat', cursor='hand2',
                                  command=lambda i=idx+1, s=spin: self._write_duty(i, s))
-            btn_w.grid(row=7 + idx, column=3, padx=2)
+            btn_w.grid(row=9 + idx, column=3, padx=2)
 
             if idx == 0:
                 self._spin1, self._btn1_r, self._btn1_w = spin, btn_r, btn_w
@@ -1143,6 +1210,29 @@ class SettingsWindow:
         self._manager.setting.systemsetting.audio_gain = gain
         self._manager.collector.set_audio_gain(gain)
 
+    def _apply_audio_band(self, low: float, high: float):
+        low = round(float(low))
+        high = round(float(high))
+        if low >= high:
+            high = low + 10
+        self._audio_low_var.set(low)
+        self._audio_high_var.set(high)
+        self._audio_low_value.config(text=f"{low:.0f} Hz")
+        self._audio_high_value.config(text=f"{high:.0f} Hz")
+        self._manager.setting.systemsetting.audio_freq_low = int(low)
+        self._manager.setting.systemsetting.audio_freq_high = int(high)
+        self._manager.collector.set_audio_band(low, high)
+
+    def _on_audio_low_changed(self, value: str):
+        low = float(value)
+        high = max(low + 10.0, float(self._audio_high_var.get()))
+        self._apply_audio_band(low, high)
+
+    def _on_audio_high_changed(self, value: str):
+        high = float(value)
+        low = min(high - 10.0, float(self._audio_low_var.get()))
+        self._apply_audio_band(low, high)
+
     def _on_close(self):
         """Persist settings edited in the dialog before closing."""
         # Leave calibration mode when the window is dismissed
@@ -1158,6 +1248,7 @@ class SettingsWindow:
             gain = self._manager.setting.systemsetting.audio_gain
         self._manager.setting.systemsetting.audio_gain = round(gain, 2)
         self._manager.collector.set_audio_gain(self._manager.setting.systemsetting.audio_gain)
+        self._apply_audio_band(self._audio_low_var.get(), self._audio_high_var.get())
         self._manager.setting.save(self._manager.setting.save_filename)
         self._app._settings_win = None
         self.win.destroy()
@@ -1279,6 +1370,11 @@ class PulseMeterApp:
             arrowcolor=THEME['text'],
             bordercolor=THEME['border'],
             padding=4,
+        )
+        style.configure('Modern.Horizontal.TScale',
+            background=THEME['bg'],
+            troughcolor=THEME['card'],
+            sliderthickness=14,
         )
 
     # ------------------------------------------------------------------
