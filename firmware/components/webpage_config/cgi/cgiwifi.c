@@ -44,6 +44,8 @@ static int g_connTryStatus = CONNTRY_IDLE;
 
 // Temp store for new ap info.
 static wifi_config_t g_wifi_config_cgi = {0};
+static wifi_config_t g_wifi_config_saved = {0};
+static wifi_config_t g_wifi_config_pending = {0};
 
 static TaskHandle_t g_staConnectHandle;
 
@@ -516,7 +518,7 @@ static void staWiFiDoConnect(void *arg)
      */
     vTaskDelay(pdMS_TO_TICKS(1000));
 
-    ESP_LOGI(TAG, "staWiFiDoConnect: to AP \"%s\" pw \"%s\"", g_wifi_config_cgi.sta.ssid, g_wifi_config_cgi.sta.password);
+    ESP_LOGI(TAG, "staWiFiDoConnect: to AP \"%s\" pw \"%s\"", g_wifi_config_pending.sta.ssid, g_wifi_config_pending.sta.password);
 
     ESP_LOGD(TAG, "Wifi disconnect ...");
     wifiDisconnect(); // waits for disconnected
@@ -533,7 +535,8 @@ static void staWiFiDoConnect(void *arg)
         mode = WIFI_MODE_STA;
     }
 
-    wifiSetConfig(WIFI_IF_STA, &g_wifi_config_cgi);
+    esp_wifi_set_storage(WIFI_STORAGE_RAM);
+    wifiSetConfig(WIFI_IF_STA, &g_wifi_config_pending);
 
     ESP_LOGD(TAG, "Connect....");
 
@@ -572,9 +575,10 @@ esp_err_t cgiWiFiConnect(httpd_req_t *req)
     } else {
         // get the current wifi configuration
         // check if we are in station mode
-        if (ESP_OK == wifiGetConfig(WIFI_IF_STA, &g_wifi_config_cgi)) {
-            strncpy((char *)g_wifi_config_cgi.sta.ssid, essid, 32);
-            strncpy((char *)g_wifi_config_cgi.sta.password, password, 64);
+        if (ESP_OK == wifiGetConfig(WIFI_IF_STA, &g_wifi_config_saved)) {
+            g_wifi_config_pending = g_wifi_config_saved;
+            strncpy((char *)g_wifi_config_pending.sta.ssid, essid, 32);
+            strncpy((char *)g_wifi_config_pending.sta.password, password, 64);
             ESP_LOGI(TAG, "Try to connect to AP \"%s\" pw \"%s\"", essid, password);
 
             // redirect & start connecting a little bit later
@@ -647,6 +651,8 @@ esp_err_t cgiWiFiConfigSuccess(httpd_req_t *req)
         // if receiced wifi config success status from client, set WiFi operating mode as only STA mode.
         if (strncmp(config_status, "success", strlen("success")) == 0) {
             ESP_LOGI(TAG, "WiFi config success, set WiFi operating mode as only STA mode.");
+            esp_wifi_set_storage(WIFI_STORAGE_FLASH);
+            wifiSetConfig(WIFI_IF_STA, &g_wifi_config_pending);
             wifiSetNewMode(WIFI_MODE_STA);
             esp_event_post(APP_NETWORK_EVENT, APP_NETWORK_EVENT_CONFIG_SUCCESS, NULL, 0, portMAX_DELAY);
             g_connTryStatus = CONNTRY_SUCCESS;

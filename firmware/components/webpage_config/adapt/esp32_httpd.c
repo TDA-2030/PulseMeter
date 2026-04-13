@@ -54,6 +54,7 @@ esp_err_t esp32HttpServerEnable(void)
     config.uri_match_fn = httpd_uri_match_wildcard;
     int handlers_num = sizeof(builtInUrls) / sizeof(httpd_uri_t);
     int captive_probe_num = sizeof(captiveProbeUrls) / sizeof(httpd_uri_t);
+    config.max_uri_handlers = handlers_num + captive_probe_num;
 
     // Start the httpd server
     ESP_LOGI(TAG, "Starting server on port: '%d'", config.server_port);
