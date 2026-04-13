@@ -27,7 +27,7 @@ typedef enum {
 
 bool wifiConnect(void);
 void wifiDisconnect(void);
-void wifiStartScan(void);
+esp_err_t wifiStartScan(void);
 void wifiStopScan(void);
 uint16_t wifiScanDone(wifi_ap_record_t **ap_records);
 

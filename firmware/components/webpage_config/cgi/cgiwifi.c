@@ -411,8 +411,15 @@ esp_err_t cgiWiFiScan(httpd_req_t *req)
         if (mode == WIFI_MODE_STA || mode == WIFI_MODE_APSTA) {
             // Start a new scan.
             ESP_LOGI(TAG, "Start a new scan ...");
-            wifiStartScan();
-            g_cgiWifiAps.scanInProgress = SCAN_RUNING;
+            if (wifiStartScan() == ESP_OK) {
+                g_cgiWifiAps.scanInProgress = SCAN_RUNING;
+            } else {
+                ESP_LOGE(TAG, "Failed to start Wi-Fi scan");
+                g_cgiWifiAps.scanInProgress = SCAN_IDLE;
+                httpd_resp_set_type(req, "application/json");
+                httpd_resp_sendstr(req, "{\n \"result\": { \n\"inProgress\": \"0\", \n\"error\": \"scan_start_failed\"\n }\n}\n");
+                return ESP_OK;
+            }
         } else {
             ESP_LOGE(TAG, "Cannot start a new scan because not in a station mode");
             return ESP_OK;

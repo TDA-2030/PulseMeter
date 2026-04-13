@@ -58,6 +58,7 @@ const int WIFI_SCAN_DONE = BIT7; //
 ESP_EVENT_DEFINE_BASE(APP_NETWORK_EVENT);
 static esp_wps_config_t wps_config = WPS_CONFIG_INIT_DEFAULT(WPS_TEST_MODE);
 static esp_netif_t *esp_netif_sta, *esp_netif_ap;
+static bool g_scan_in_progress = false;
 
 static const char *auth2str(int auth)
 {
@@ -162,8 +163,12 @@ static void wifiEventHandlerCb(void *arg, esp_event_base_t event_base,
         case WIFI_EVENT_STA_DISCONNECTED: {
             // ESP32 station disconnected from AP
             ESP_LOGI(TAG, "SYSTEM_EVENT_STA_DISCONNECTED");
-            // This is a workaround as ESP32 WiFi libs don't currently auto-reassociate.
-            ESP_ERROR_CHECK(esp_wifi_connect());
+            if (!g_scan_in_progress) {
+                // This is a workaround as ESP32 WiFi libs don't currently auto-reassociate.
+                ESP_ERROR_CHECK(esp_wifi_connect());
+            } else {
+                ESP_LOGI(TAG, "Skip auto-reconnect because a Wi-Fi scan is in progress");
+            }
 
             xEventGroupSetBits(g_wifi_event_group, WIFI_STA_DISCONNECT);
             xEventGroupClearBits(g_wifi_event_group, WIFI_STA_CONNECTED);
@@ -355,49 +360,75 @@ void wifiDisconnect(void)
     ESP_LOGI(TAG, "Disconnected " IPSTR, GOOD_IP2STR(ipInfo.ip.addr));
 }
 
-void wifiStartScan(void)
+esp_err_t wifiStartScan(void)
 {
     ESP_LOGD(TAG, "wifiStartScan");
 
     wifi_mode_t mode;
     esp_wifi_get_mode(&mode);
 
-    if (mode & WIFI_MODE_STA) {
-        wifi_config_t wifi_config = {0};
-
-        if (ESP_OK == esp_wifi_get_config(WIFI_IF_STA, &wifi_config)) {
-            wifi_config.sta.bssid_set = 0; // no need to check MAC address of AP
-            wifi_config.sta.scan_method = WIFI_ALL_CHANNEL_SCAN;
-            wifi_config.sta.sort_method = WIFI_CONNECT_AP_BY_SIGNAL;
-
-            ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
-        }
-
-        // configure and run the scan process in nonblocking mode
-        wifi_scan_config_t scan_config = {
-            .ssid = 0,
-            .bssid = 0,
-            .channel = 0,
-            .show_hidden = false, // don't show hidden access points
-            .scan_type = WIFI_SCAN_TYPE_ACTIVE,
-            .scan_time.active =
-            {
-                .min = 0,
-                .max = 0
-            }
-        };
-
-        ESP_LOGD(TAG, "Start Scanning ...");
-        esp_wifi_disconnect();
-        ESP_ERROR_CHECK(esp_wifi_scan_start(&scan_config, false));
-    } else {
+    if (!(mode & WIFI_MODE_STA)) {
         ESP_LOGE(TAG, "Cannot start a new scan because not in a station mode");
+        return ESP_ERR_WIFI_MODE;
     }
+
+    g_scan_in_progress = true;
+    xEventGroupClearBits(g_wifi_event_group, WIFI_SCAN_DONE);
+
+    esp_err_t err = esp_wifi_disconnect();
+    if (err != ESP_OK && err != ESP_ERR_WIFI_NOT_CONNECT) {
+        ESP_LOGE(TAG, "Failed to disconnect before scan: %s", esp_err_to_name(err));
+        g_scan_in_progress = false;
+        return err;
+    }
+
+    wifi_config_t wifi_config = {0};
+    err = esp_wifi_get_config(WIFI_IF_STA, &wifi_config);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to get STA config before scan: %s", esp_err_to_name(err));
+        g_scan_in_progress = false;
+        return err;
+    }
+
+    wifi_config.sta.bssid_set = 0; // no need to check MAC address of AP
+    wifi_config.sta.scan_method = WIFI_ALL_CHANNEL_SCAN;
+    wifi_config.sta.sort_method = WIFI_CONNECT_AP_BY_SIGNAL;
+
+    err = esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
+    if (err != ESP_OK && err != ESP_ERR_WIFI_STATE) {
+        ESP_LOGE(TAG, "Failed to prepare STA config for scan: %s", esp_err_to_name(err));
+        g_scan_in_progress = false;
+        return err;
+    }
+
+    wifi_scan_config_t scan_config = {
+        .ssid = 0,
+        .bssid = 0,
+        .channel = 0,
+        .show_hidden = false,
+        .scan_type = WIFI_SCAN_TYPE_ACTIVE,
+        .scan_time.active =
+        {
+            .min = 0,
+            .max = 0
+        }
+    };
+
+    ESP_LOGD(TAG, "Start Scanning ...");
+    err = esp_wifi_scan_start(&scan_config, false);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to start scan: %s", esp_err_to_name(err));
+        g_scan_in_progress = false;
+        return err;
+    }
+
+    return ESP_OK;
 }
 
 void wifiStopScan(void)
 {
     esp_wifi_scan_stop();
+    g_scan_in_progress = false;
     xEventGroupClearBits(g_wifi_event_group, WIFI_SCAN_DONE);
 }
 
@@ -451,6 +482,7 @@ uint16_t wifiScanDone(wifi_ap_record_t **ap_records)
     }
 
     xEventGroupClearBits(g_wifi_event_group, WIFI_SCAN_DONE);
+    g_scan_in_progress = false;
     return ap_num;
 }
 
