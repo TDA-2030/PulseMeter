@@ -134,7 +134,7 @@ def build(onedir: bool = False, debug: bool = False) -> int:
     cmd += ["--specpath", str(PROJECT_ROOT)]
     cmd += ["--paths", str(PROJECT_ROOT / "src")]
     cmd += ["--clean", "--noconfirm"]
-    cmd.append(str(PACKAGE_ROOT / "__main__.py"))
+    cmd.append(str(PACKAGE_ROOT / "app.py"))
 
     print(f"[build] Platform : {SYSTEM} ({platform.machine()})")
     print(f"[build] Mode     : {'onedir' if onedir else 'onefile'}")

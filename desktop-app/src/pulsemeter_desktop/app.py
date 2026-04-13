@@ -18,7 +18,13 @@ import traceback
 import pystray
 from PIL import Image
 from pathlib import Path
-from .settings import APP_NAME, Setting, get_app_config_dir
+PACKAGE_ROOT = Path(__file__).resolve().parent
+
+if __package__ in (None, ""):
+    sys.path.insert(0, str(PACKAGE_ROOT.parent))
+    from pulsemeter_desktop.settings import APP_NAME, Setting, get_app_config_dir
+else:
+    from .settings import APP_NAME, Setting, get_app_config_dir
 
 from zeroconf import ServiceBrowser, ServiceStateChange, Zeroconf
 
@@ -27,7 +33,7 @@ if os.name == "nt":
 else:
     import fcntl
 
-ROOT = Path(os.path.abspath(__file__)).parent
+ROOT = PACKAGE_ROOT
 print(f"ROOT: {ROOT}")
 
 # ---------- Bundled font loader ----------
