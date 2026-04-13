@@ -24,6 +24,12 @@ def _config_dir() -> Path:
     return base / APP_NAME
 
 
+def get_app_config_dir() -> Path:
+    config_dir = _config_dir()
+    config_dir.mkdir(parents=True, exist_ok=True)
+    return config_dir
+
+
 class SetItem():
     def __init__(self, name:str) -> None:
         self.setting_name = name
@@ -45,8 +51,7 @@ class Setting():
     def __init__(self) -> None:
         self.systemsetting = SystemSetting()
 
-        config_dir = _config_dir()
-        config_dir.mkdir(parents=True, exist_ok=True)
+        config_dir = get_app_config_dir()
         self.save_filename = config_dir / "sys-settings.json"
 
         if self.save_filename.is_file():

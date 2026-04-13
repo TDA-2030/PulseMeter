@@ -2,15 +2,6 @@
 
 Python desktop UI for the PulseMeter hardware meter.
 
-## Layout
-
-```text
-desktop-app/
-  src/pulsemeter_desktop/   Application package
-  scripts/build.py          PyInstaller build entry
-  pyproject.toml            Project metadata and dependencies
-```
-
 ## Development
 
 ```bash

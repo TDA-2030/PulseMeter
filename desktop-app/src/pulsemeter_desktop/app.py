@@ -1,5 +1,6 @@
 import tkinter as tk
 from tkinter import ttk
+import sys
 import time
 import os
 import platform
@@ -17,9 +18,14 @@ import traceback
 import pystray
 from PIL import Image
 from pathlib import Path
-from .settings import Setting
+from .settings import APP_NAME, Setting, get_app_config_dir
 
 from zeroconf import ServiceBrowser, ServiceStateChange, Zeroconf
+
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
 
 ROOT = Path(os.path.abspath(__file__)).parent
 print(f"ROOT: {ROOT}")
@@ -103,6 +109,43 @@ def _load_bundled_fonts() -> str:
 
 _FF = _load_bundled_fonts()
 print(f'[font] Using font family: {_FF}')
+
+
+class SingleInstanceLock:
+    def __init__(self, app_name: str):
+        self.lock_path = get_app_config_dir() / f"{app_name.lower()}.lock"
+        self._handle = None
+
+    def acquire(self) -> bool:
+        self._handle = open(self.lock_path, "a+", encoding="utf-8")
+        try:
+            if os.name == "nt":
+                self._handle.seek(0)
+                msvcrt.locking(self._handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                fcntl.flock(self._handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self._handle.seek(0)
+            self._handle.truncate()
+            self._handle.write(str(os.getpid()))
+            self._handle.flush()
+            return True
+        except OSError:
+            self.release()
+            return False
+
+    def release(self) -> None:
+        if self._handle is None:
+            return
+        try:
+            if os.name == "nt":
+                self._handle.seek(0)
+                msvcrt.locking(self._handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(self._handle.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        self._handle.close()
+        self._handle = None
 
 
 # -------------------- Device discovery (mDNS) --------------------
@@ -1802,18 +1845,26 @@ class TrayApp:
 
 
 def main() -> None:
-    root = tk.Tk()
-    # Set the window title-bar / taskbar icon
-    try:
-        icon_path = ROOT / "assets" / "icon.ico"
-        root.iconbitmap(str(icon_path))
-    except Exception:
-        pass
+    instance_lock = SingleInstanceLock(APP_NAME)
+    if not instance_lock.acquire():
+        print(f"{APP_NAME} is already running.")
+        sys.exit(0)
 
-    app = PulseMeterApp(root)
-    tray = TrayApp(root, app)
-    tray.run()
-    root.mainloop()
+    root = tk.Tk()
+    try:
+        # Set the window title-bar / taskbar icon
+        try:
+            icon_path = ROOT / "assets" / "icon.ico"
+            root.iconbitmap(str(icon_path))
+        except Exception:
+            pass
+
+        app = PulseMeterApp(root)
+        tray = TrayApp(root, app)
+        tray.run()
+        root.mainloop()
+    finally:
+        instance_lock.release()
 
 
 if __name__ == "__main__":
