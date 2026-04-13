@@ -17,7 +17,7 @@ import traceback
 import pystray
 from PIL import Image
 from pathlib import Path
-from settings import Setting
+from .settings import Setting
 
 from zeroconf import ServiceBrowser, ServiceStateChange, Zeroconf
 
@@ -1801,7 +1801,7 @@ class TrayApp:
         self.root.destroy()
 
 
-if __name__ == "__main__":
+def main() -> None:
     root = tk.Tk()
     # Set the window title-bar / taskbar icon
     try:
@@ -1814,3 +1814,7 @@ if __name__ == "__main__":
     tray = TrayApp(root, app)
     tray.run()
     root.mainloop()
+
+
+if __name__ == "__main__":
+    main()

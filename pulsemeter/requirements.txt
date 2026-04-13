@@ -1,8 +1,0 @@
-pyinstaller
-pillow
-psutil
-numpy
-pystray
-pyyaml
-soundcard
-zeroconf

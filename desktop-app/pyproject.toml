@@ -1,0 +1,33 @@
+[project]
+name = "pulsemeter-desktop"
+version = "0.1.0"
+description = "Desktop companion app for the PulseMeter hardware meter"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+dependencies = [
+    "numpy==2.2",
+    "pillow>=11.3.0",
+    "psutil>=7.0.0",
+    "pyinstaller>=6.15.0",
+    "pystray>=0.19.5",
+    "pyyaml>=6.0.2",
+    "soundcard>=0.4.4",
+    "zeroconf>=0.148.0",
+]
+
+[project.scripts]
+pulsemeter-desktop = "pulsemeter_desktop.app:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+pulsemeter_desktop = ["assets/*", "fonts/*"]

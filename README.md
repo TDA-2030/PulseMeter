@@ -2,7 +2,7 @@
 
 <div align="center">
 
-![logo](pulsemeter/assets/logo.png)
+![logo](desktop-app/src/pulsemeter_desktop/assets/logo.png)
 
 **把电脑负载变成一根会动的表针**
 
@@ -50,9 +50,9 @@ idf.py build flash monitor
 **运行客户端**
 
 ```bash
-cd pulsemeter
-pip install -r requirements.txt
-python pulsemeter.py
+cd desktop-app
+pip install -e .
+python -m pulsemeter_desktop
 ```
 
 首次启动后在 GUI 中填入设备 IP（或等待 mDNS 自动发现），选择每根针对应的指标，保存即生效。
@@ -60,9 +60,9 @@ python pulsemeter.py
 ## 打包为可执行文件
 
 ```bash
-cd pulsemeter
-python build.py          # 生成单文件可执行程序
-python build.py --onedir # 生成目录包（启动更快）
+cd desktop-app
+python scripts/build.py          # 生成单文件可执行程序
+python scripts/build.py --onedir # 生成目录包（启动更快）
 ```
 
 ## TCP 数据包格式
