@@ -16,6 +16,7 @@ static const httpd_uri_t builtInUrls[] = {
     {.uri = "/connstatus.cgi",     .method = HTTP_GET,    .handler = cgiWiFiConnStatus,      .user_ctx  = NULL},
     {.uri = "/configsuccess.cgi",  .method = HTTP_POST,   .handler = cgiWiFiConfigSuccess,   .user_ctx  = NULL},
     {.uri = "/*",                  .method = HTTP_GET,    .handler = cgi_common_get_handler, .user_ctx  = NULL},
+    {.uri = "/*",                  .method = HTTP_HEAD,   .handler = cgi_common_head_handler,.user_ctx  = NULL},
     // {.uri = "/setmode.cgi",        .method = HTTP_GET,    .handler = cgiWiFiSetMode,         .user_ctx  = NULL},
 };
 

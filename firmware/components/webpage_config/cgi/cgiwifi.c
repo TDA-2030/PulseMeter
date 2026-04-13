@@ -47,6 +47,8 @@ static wifi_config_t g_wifi_config_cgi = {0};
 
 static TaskHandle_t g_staConnectHandle;
 
+static void httpdRedirect(httpd_req_t *req, const char *newUrl);
+
 // --------------------------------------------------------------------------
 // taken from MightyPork/libesphttpd
 // --------------------------------------------------------------------------
@@ -332,9 +334,20 @@ esp_err_t cgi_common_get_handler(httpd_req_t *req)
         set_content_type_from_file(req, req->uri);
         return httpd_resp_send(req, (const char *)connecting_start, connecting_size);
     } else {
-        ESP_LOGE(TAG, "Unsupport URI \"%s\"", req->uri);
+        ESP_LOGW(TAG, "Redirect unsupported URI \"%s\" to captive portal", req->uri);
+        httpdRedirect(req, "http://192.168.4.1/");
+        return ESP_OK;
     }
 
+    return ESP_OK;
+}
+
+esp_err_t cgi_common_head_handler(httpd_req_t *req)
+{
+    ESP_LOGD(TAG, "Common HEAD uri:\"%s\"", req->uri);
+    httpd_resp_set_status(req, "302 Redirect");
+    httpd_resp_set_hdr(req, "Location", "http://192.168.4.1/");
+    httpd_resp_send(req, NULL, 0);
     return ESP_OK;
 }
 
