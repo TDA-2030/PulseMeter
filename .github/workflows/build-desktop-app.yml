@@ -1,0 +1,61 @@
+name: Build Desktop App
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - master
+      - main
+    paths:
+      - ".github/workflows/build-desktop-app.yml"
+      - "desktop-app/**"
+
+jobs:
+  build:
+    name: Build ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact_name: PulseMeter-windows
+            artifact_path: desktop-app/dist/PulseMeter.exe
+          - os: ubuntu-latest
+            artifact_name: PulseMeter-linux
+            artifact_path: desktop-app/dist/PulseMeter
+          - os: macos-latest
+            artifact_name: PulseMeter-macos
+            artifact_path: desktop-app/dist/PulseMeter
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev
+
+      - name: Install desktop-app dependencies
+        working-directory: desktop-app
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install .
+
+      - name: Build single-file desktop app
+        working-directory: desktop-app
+        run: python scripts/build.py
+
+      - name: Upload packaged app
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.artifact_path }}
+          if-no-files-found: error
