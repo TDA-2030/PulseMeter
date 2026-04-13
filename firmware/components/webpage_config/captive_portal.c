@@ -16,6 +16,8 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
+#include "lwip/sockets.h"
+#include "lwip/inet.h"
 #include "adapt/esp32_wifi.h"
 #include "adapt/esp32_httpd.h"
 #include "cgi/cgiwifi.h"
@@ -24,9 +26,130 @@
 static const char *TAG = "captive_portal";
 static bool g_configed = 0;
 static esp_timer_handle_t prov_stop_timer;
+static TaskHandle_t s_dns_task_handle = NULL;
+static int s_dns_sock = -1;
 
 esp_err_t config_timer_start(int TIMEOUT_PERIOD);
 esp_err_t config_timer_delete(void);
+static esp_err_t dns_server_start(void);
+static void dns_server_stop(void);
+
+#define DNS_PORT 53
+
+typedef struct {
+    uint16_t id;
+    uint16_t flags;
+    uint16_t qdcount;
+    uint16_t ancount;
+    uint16_t nscount;
+    uint16_t arcount;
+} dns_header_t;
+
+static void captive_dns_task(void *arg)
+{
+    (void)arg;
+
+    int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (sock < 0) {
+        ESP_LOGE(TAG, "DNS socket create failed");
+        s_dns_task_handle = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
+    s_dns_sock = sock;
+
+    struct sockaddr_in addr = {0};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(DNS_PORT);
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+
+    if (bind(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        ESP_LOGE(TAG, "DNS bind failed");
+        close(sock);
+        s_dns_sock = -1;
+        s_dns_task_handle = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    ESP_LOGI(TAG, "Captive DNS started");
+
+    uint8_t rx_buf[256];
+    while (1) {
+        struct sockaddr_in source_addr = {0};
+        socklen_t socklen = sizeof(source_addr);
+        int len = recvfrom(sock, rx_buf, sizeof(rx_buf), 0, (struct sockaddr *)&source_addr, &socklen);
+        if (len < 0) {
+            break;
+        }
+        if (len < sizeof(dns_header_t)) {
+            continue;
+        }
+
+        dns_header_t *hdr = (dns_header_t *)rx_buf;
+        uint8_t *ptr = rx_buf + len;
+        uint8_t *q = rx_buf + sizeof(dns_header_t);
+
+        while (q < rx_buf + len && *q) {
+            q += (*q) + 1;
+        }
+        if (q >= rx_buf + len) {
+            continue;
+        }
+
+        ptr[0]  = 0xC0;
+        ptr[1]  = 0x0C;
+        ptr[2]  = 0x00;
+        ptr[3]  = 0x01;
+        ptr[4]  = 0x00;
+        ptr[5]  = 0x01;
+        ptr[6]  = 0x00;
+        ptr[7]  = 0x00;
+        ptr[8]  = 0x00;
+        ptr[9]  = 0x1E;
+        ptr[10] = 0x00;
+        ptr[11] = 0x04;
+        ptr[12] = 192;
+        ptr[13] = 168;
+        ptr[14] = 4;
+        ptr[15] = 1;
+
+        hdr->flags = htons(0x8180);
+        hdr->ancount = htons(1);
+
+        sendto(sock, rx_buf, len + 16, 0, (struct sockaddr *)&source_addr, sizeof(source_addr));
+    }
+
+    close(sock);
+    s_dns_sock = -1;
+    s_dns_task_handle = NULL;
+    ESP_LOGI(TAG, "Captive DNS stopped");
+    vTaskDelete(NULL);
+}
+
+static esp_err_t dns_server_start(void)
+{
+    if (s_dns_task_handle != NULL) {
+        return ESP_OK;
+    }
+
+    BaseType_t ok = xTaskCreate(captive_dns_task, "cp_dns", 4096, NULL, 3, &s_dns_task_handle);
+    if (ok != pdPASS) {
+        ESP_LOGE(TAG, "Failed to start captive DNS task");
+        s_dns_task_handle = NULL;
+        return ESP_FAIL;
+    }
+    return ESP_OK;
+}
+
+static void dns_server_stop(void)
+{
+    if (s_dns_sock >= 0) {
+        close(s_dns_sock);
+        s_dns_sock = -1;
+    }
+    /* Task exits on socket close and clears s_dns_task_handle itself. */
+}
 
 static void event_handler(void *arg, esp_event_base_t event_base,
                           int32_t event_id, void *event_data)
@@ -37,6 +160,7 @@ static void event_handler(void *arg, esp_event_base_t event_base,
         case APP_NETWORK_EVENT_PROV_TIMEOUT:
             config_timer_delete();
             esp32HttpServerDisable();
+            dns_server_stop();
             break;
         case APP_NETWORK_EVENT_PROV_START:
             break;
@@ -56,6 +180,11 @@ esp_err_t captive_portal_start(void)
     ESP_LOGD(TAG, "Free heap size before enable http server: %d", esp_get_free_heap_size());
     ret = esp32HttpServerEnable();
     if (ESP_OK != ret) {
+        return ESP_FAIL;
+    }
+    ret = dns_server_start();
+    if (ESP_OK != ret) {
+        esp32HttpServerDisable();
         return ESP_FAIL;
     }
 
