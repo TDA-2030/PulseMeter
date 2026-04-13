@@ -111,6 +111,17 @@ _FF = _load_bundled_fonts()
 print(f'[font] Using font family: {_FF}')
 
 
+def _apply_window_icon(window) -> None:
+    """Apply the bundled ICO app icon to a Tk window or toplevel."""
+    icon_ico = ROOT / "assets" / "icon.ico"
+
+    try:
+        if icon_ico.exists():
+            window.iconbitmap(str(icon_ico))
+    except Exception:
+        pass
+
+
 class SingleInstanceLock:
     def __init__(self, app_name: str):
         self.lock_path = get_app_config_dir() / f"{app_name.lower()}.lock"
@@ -1032,6 +1043,7 @@ class SettingsWindow:
         win.geometry(f"420x470+{parent_x}+{parent_y}")
         win.resizable(False, False)
         win.configure(bg=THEME['bg'])
+        _apply_window_icon(win)
         win.transient(parent)
         win.grab_set()
         win.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -1852,12 +1864,7 @@ def main() -> None:
 
     root = tk.Tk()
     try:
-        # Set the window title-bar / taskbar icon
-        try:
-            icon_path = ROOT / "assets" / "icon.ico"
-            root.iconbitmap(str(icon_path))
-        except Exception:
-            pass
+        _apply_window_icon(root)
 
         app = PulseMeterApp(root)
         tray = TrayApp(root, app)
