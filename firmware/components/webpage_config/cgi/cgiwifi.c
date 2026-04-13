@@ -48,6 +48,8 @@ static wifi_config_t g_wifi_config_cgi = {0};
 static TaskHandle_t g_staConnectHandle;
 
 static void httpdRedirect(httpd_req_t *req, const char *newUrl);
+static bool is_portal_html_uri(const char *uri);
+static bool is_redirect_probe_uri(const char *uri);
 
 // --------------------------------------------------------------------------
 // taken from MightyPork/libesphttpd
@@ -293,15 +295,54 @@ static esp_err_t index_html_get_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+static bool is_portal_html_uri(const char *uri)
+{
+    return strcmp(uri, "/") == 0 ||
+           strcmp(uri, "/index.html") == 0 ||
+           strcmp(uri, "/wifi.tpl") == 0 ||
+           strcmp(uri, "/hotspot-detect.html") == 0 ||
+           strcmp(uri, "/library/test/success.html") == 0;
+}
+
+static bool is_redirect_probe_uri(const char *uri)
+{
+    return strcmp(uri, "/generate_204") == 0 ||
+           strcmp(uri, "/gen_204") == 0 ||
+           strcmp(uri, "/redirect") == 0 ||
+           strcmp(uri, "/connecttest.txt") == 0 ||
+           strcmp(uri, "/ncsi.txt") == 0 ||
+           strcmp(uri, "/success.txt") == 0 ||
+           strcmp(uri, "/canonical.html") == 0 ||
+           strcmp(uri, "/kindle-wifi/wifiredirect.html") == 0 ||
+           strcmp(uri, "/fwlink") == 0;
+}
+
+esp_err_t cgi_captive_probe_get_handler(httpd_req_t *req)
+{
+    ESP_LOGI(TAG, "Captive probe GET uri:\"%s\"", req->uri);
+
+    if (is_portal_html_uri(req->uri)) {
+        return index_html_get_handler(req);
+    }
+
+    httpdRedirect(req, "http://192.168.4.1/");
+    return ESP_OK;
+}
+
+esp_err_t cgi_captive_probe_head_handler(httpd_req_t *req)
+{
+    ESP_LOGI(TAG, "Captive probe HEAD uri:\"%s\"", req->uri);
+    httpd_resp_set_status(req, "302 Redirect");
+    httpd_resp_set_hdr(req, "Location", "http://192.168.4.1/");
+    httpd_resp_send(req, NULL, 0);
+    return ESP_OK;
+}
+
 esp_err_t cgi_common_get_handler(httpd_req_t *req)
 {
     ESP_LOGD(TAG, "Common GET uri:\"%s\"", req->uri);
 
-    if (req->uri[strlen(req->uri) - 1] == '/') {
-        return index_html_get_handler(req);
-    } else if (strcmp(req->uri, "/index.html") == 0) {
-        return index_html_get_handler(req);
-    } else if (strcmp(req->uri, "/wifi.tpl") == 0) {
+    if (is_portal_html_uri(req->uri)) {
         return index_html_get_handler(req);
     } else if (strcmp(req->uri, "/favicon.ico") == 0) {
         extern const unsigned char favicon_ico_start[] asm("_binary_cfg_favicon_ico_start");
@@ -333,6 +374,8 @@ esp_err_t cgi_common_get_handler(httpd_req_t *req)
         const size_t connecting_size = (connecting_end - connecting_start);
         set_content_type_from_file(req, req->uri);
         return httpd_resp_send(req, (const char *)connecting_start, connecting_size);
+    } else if (is_redirect_probe_uri(req->uri)) {
+        return cgi_captive_probe_get_handler(req);
     } else {
         ESP_LOGW(TAG, "Redirect unsupported URI \"%s\" to captive portal", req->uri);
         httpdRedirect(req, "http://192.168.4.1/");

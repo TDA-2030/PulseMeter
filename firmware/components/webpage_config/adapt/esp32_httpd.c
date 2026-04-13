@@ -10,6 +10,31 @@ static const char *TAG = "esp32_httpd";
 
 static httpd_handle_t g_server;
 
+static const httpd_uri_t captiveProbeUrls[] = {
+    {.uri = "/generate_204",                 .method = HTTP_GET,  .handler = cgi_captive_probe_get_handler,  .user_ctx = NULL},
+    {.uri = "/generate_204",                 .method = HTTP_HEAD, .handler = cgi_captive_probe_head_handler, .user_ctx = NULL},
+    {.uri = "/gen_204",                      .method = HTTP_GET,  .handler = cgi_captive_probe_get_handler,  .user_ctx = NULL},
+    {.uri = "/gen_204",                      .method = HTTP_HEAD, .handler = cgi_captive_probe_head_handler, .user_ctx = NULL},
+    {.uri = "/hotspot-detect.html",          .method = HTTP_GET,  .handler = cgi_captive_probe_get_handler,  .user_ctx = NULL},
+    {.uri = "/hotspot-detect.html",          .method = HTTP_HEAD, .handler = cgi_captive_probe_head_handler, .user_ctx = NULL},
+    {.uri = "/library/test/success.html",    .method = HTTP_GET,  .handler = cgi_captive_probe_get_handler,  .user_ctx = NULL},
+    {.uri = "/library/test/success.html",    .method = HTTP_HEAD, .handler = cgi_captive_probe_head_handler, .user_ctx = NULL},
+    {.uri = "/connecttest.txt",              .method = HTTP_GET,  .handler = cgi_captive_probe_get_handler,  .user_ctx = NULL},
+    {.uri = "/connecttest.txt",              .method = HTTP_HEAD, .handler = cgi_captive_probe_head_handler, .user_ctx = NULL},
+    {.uri = "/ncsi.txt",                     .method = HTTP_GET,  .handler = cgi_captive_probe_get_handler,  .user_ctx = NULL},
+    {.uri = "/ncsi.txt",                     .method = HTTP_HEAD, .handler = cgi_captive_probe_head_handler, .user_ctx = NULL},
+    {.uri = "/success.txt",                  .method = HTTP_GET,  .handler = cgi_captive_probe_get_handler,  .user_ctx = NULL},
+    {.uri = "/success.txt",                  .method = HTTP_HEAD, .handler = cgi_captive_probe_head_handler, .user_ctx = NULL},
+    {.uri = "/canonical.html",               .method = HTTP_GET,  .handler = cgi_captive_probe_get_handler,  .user_ctx = NULL},
+    {.uri = "/canonical.html",               .method = HTTP_HEAD, .handler = cgi_captive_probe_head_handler, .user_ctx = NULL},
+    {.uri = "/kindle-wifi/wifiredirect.html",.method = HTTP_GET,  .handler = cgi_captive_probe_get_handler,  .user_ctx = NULL},
+    {.uri = "/kindle-wifi/wifiredirect.html",.method = HTTP_HEAD, .handler = cgi_captive_probe_head_handler, .user_ctx = NULL},
+    {.uri = "/redirect",                     .method = HTTP_GET,  .handler = cgi_captive_probe_get_handler,  .user_ctx = NULL},
+    {.uri = "/redirect",                     .method = HTTP_HEAD, .handler = cgi_captive_probe_head_handler, .user_ctx = NULL},
+    {.uri = "/fwlink",                       .method = HTTP_GET,  .handler = cgi_captive_probe_get_handler,  .user_ctx = NULL},
+    {.uri = "/fwlink",                       .method = HTTP_HEAD, .handler = cgi_captive_probe_head_handler, .user_ctx = NULL},
+};
+
 static const httpd_uri_t builtInUrls[] = {
     {.uri = "/wifiscan.cgi",       .method = HTTP_GET,    .handler = cgiWiFiScan,            .user_ctx  = NULL},
     {.uri = "/connect.cgi",        .method = HTTP_POST,   .handler = cgiWiFiConnect,         .user_ctx  = NULL},
@@ -28,6 +53,7 @@ esp_err_t esp32HttpServerEnable(void)
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.uri_match_fn = httpd_uri_match_wildcard;
     int handlers_num = sizeof(builtInUrls) / sizeof(httpd_uri_t);
+    int captive_probe_num = sizeof(captiveProbeUrls) / sizeof(httpd_uri_t);
 
     // Start the httpd server
     ESP_LOGI(TAG, "Starting server on port: '%d'", config.server_port);
@@ -35,6 +61,14 @@ esp_err_t esp32HttpServerEnable(void)
     if (httpd_start(&g_server, &config) == ESP_OK) {
         // Set URI handlers
         ESP_LOGI(TAG, "Registering URI handlers");
+
+        for (int i = 0; i < captive_probe_num; i++) {
+            if (httpd_register_uri_handler(g_server, &captiveProbeUrls[i]) != ESP_OK) {
+                ESP_LOGE(TAG, "register captive probe uri failed for %d", i);
+                httpd_stop(g_server);
+                return ESP_FAIL;
+            }
+        }
 
         for (int i = 0; i < handlers_num; i++) {
             if (httpd_register_uri_handler(g_server, &builtInUrls[i]) != ESP_OK) {

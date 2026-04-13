@@ -12,6 +12,8 @@ esp_err_t cgi_is_success(void);
 
 esp_err_t cgi_common_get_handler(httpd_req_t *req);
 esp_err_t cgi_common_head_handler(httpd_req_t *req);
+esp_err_t cgi_captive_probe_get_handler(httpd_req_t *req);
+esp_err_t cgi_captive_probe_head_handler(httpd_req_t *req);
 esp_err_t cgiWiFiScan(httpd_req_t *req);
 // esp_err_t tplWlan(httpd_req_t *req, char *token, void **arg);
 // esp_err_t cgiWiFi(httpd_req_t *req);
