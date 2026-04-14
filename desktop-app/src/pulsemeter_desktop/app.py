@@ -1138,7 +1138,7 @@ class SettingsWindow:
 
         win = tk.Toplevel(parent)
         win.title("Settings")
-        win.geometry(f"420x470+{parent_x}+{parent_y}")
+        win.geometry(f"420x500+{parent_x}+{parent_y}")
         win.resizable(False, False)
         win.configure(bg=THEME['bg'])
         _apply_window_icon(win)
@@ -1153,6 +1153,13 @@ class SettingsWindow:
         hdr.pack_propagate(False)
         tk.Label(hdr, text="Settings", bg=THEME['surface'],
                  fg=THEME['text'], font=FONT['title']).pack(side='left', padx=16, pady=10)
+
+        # --- Footer ---
+        footer = tk.Frame(win, bg=THEME['surface'])
+        footer.pack(fill='x', side='bottom')
+        _HoverButton(footer, text="Close", bg=THEME['card'], hover_bg=THEME['border'],
+                     fg=THEME['text'], font=FONT['btn'], relief='flat', cursor='hand2',
+                     padx=20, pady=6, command=self._on_close).pack(side='right', padx=16, pady=12)
 
         # --- Body ---
         body = tk.Frame(win, bg=THEME['bg'], padx=20, pady=12)
@@ -1326,14 +1333,6 @@ class SettingsWindow:
                 self._spin2, self._btn2_r, self._btn2_w = spin, btn_r, btn_w
 
         body.grid_columnconfigure(1, weight=1)
-
-        # --- Footer ---
-        footer = tk.Frame(win, bg=THEME['surface'], height=48)
-        footer.pack(fill='x', side='bottom')
-        footer.pack_propagate(False)
-        _HoverButton(footer, text="Close", bg=THEME['card'], hover_bg=THEME['border'],
-                     fg=THEME['text'], font=FONT['btn'], relief='flat', cursor='hand2',
-                     padx=20, command=self._on_close).pack(side='right', padx=16, pady=10)
 
     # ------------------------------------------------------------------
     # Public refresh methods called by PulseMeterApp
