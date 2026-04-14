@@ -639,6 +639,8 @@ class DataCollector:
         self._audio_gain: float = 1.0
         self._audio_freq_low: float = 200.0
         self._audio_freq_high: float = 2000.0
+        self._vu_level: float = 0.0
+        self._peak_level: float = 0.0
         self._audio_stop = threading.Event()
         self._audio_thread: threading.Thread | None = None
         # Cache of the last non-audio data frame.  Written by _run() at 0.5 s;
@@ -666,6 +668,42 @@ class DataCollector:
         high = max(low + 1.0, high)
         self._audio_freq_low = low
         self._audio_freq_high = high
+
+    @staticmethod
+    def _db_to_percent(db: float, floor_db: float) -> float:
+        return max(0.0, min(100.0, (db - floor_db) / abs(floor_db) * 100.0))
+
+    def compute_vu_level(self, samples: np.ndarray, dt: float) -> float:
+        """Return a VU-style level in the range 0-100."""
+        rms = float(np.sqrt(np.mean(np.square(samples)))) * self._audio_gain if samples.size else 0.0
+        if rms <= 1e-6:
+            target = 0.0
+        else:
+            db = 20 * np.log10(rms)
+            target = 0.0 if db < -54.0 else self._db_to_percent(db, -48.0)
+
+        attack_s = 0.015
+        release_s = 0.05
+        tau = attack_s if target > self._vu_level else release_s
+        alpha = 1.0 - np.exp(-max(dt, 1e-3) / tau)
+        self._vu_level += (target - self._vu_level) * alpha
+        return round(max(0.0, min(100.0, self._vu_level)), 2)
+
+    def compute_peak_level(self, samples: np.ndarray, dt: float) -> float:
+        """Return a peak-style level in the range 0-100."""
+        peak = float(np.max(np.abs(samples))) * self._audio_gain if samples.size else 0.0
+        if peak <= 1e-6:
+            target = 0.0
+        else:
+            db = 20 * np.log10(peak)
+            target = 0.0 if db < -60.0 else self._db_to_percent(db, -42.0)
+
+        attack_s = 0.015
+        release_s = 0.05
+        tau = attack_s if target > self._peak_level else release_s
+        alpha = 1.0 - np.exp(-max(dt, 1e-3) / tau)
+        self._peak_level += (target - self._peak_level) * alpha
+        return round(max(0.0, min(100.0, self._peak_level)), 2)
 
     def start(self, interval=1.0, metrics=None, callback=None):
         self.interval = interval
@@ -737,13 +775,9 @@ class DataCollector:
                     spectrum[(freqs < freq_low) | (freqs > freq_high)] = 0
                     bass     = np.fft.irfft(spectrum, len(buf_win))
 
-                    rms = np.sqrt(np.mean(np.square(bass))) * self._audio_gain
-                    if rms > 1e-6:
-                        # dB scale: [-60 dB, 0 dB] → [0, 100]
-                        db = 20 * np.log10(rms)
-                        self._audio_level = round(max(0.0, min(100.0, (db + 60) / 60 * 100)), 2)
-                    else:
-                        self._audio_level = 0.0
+                    self._audio_level = self.compute_peak_level(
+                        bass, self._AUDIO_CHUNK_S
+                    )
 
                     # Drive the callback at audio rate.  Take a GIL-safe snapshot
                     # of the non-audio cache and inject the fresh audio level so
