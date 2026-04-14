@@ -641,6 +641,10 @@ class DataCollector:
         self._audio_freq_high: float = 2000.0
         self._vu_level: float = 0.0
         self._peak_level: float = 0.0
+        self._filter_samplerate: int | None = None
+        self._filter_band: tuple[float, float] | None = None
+        self._filter_taps: np.ndarray | None = None
+        self._filter_state: np.ndarray | None = None
         self._audio_stop = threading.Event()
         self._audio_thread: threading.Thread | None = None
         # Cache of the last non-audio data frame.  Written by _run() at 0.5 s;
@@ -668,6 +672,31 @@ class DataCollector:
         high = max(low + 1.0, high)
         self._audio_freq_low = low
         self._audio_freq_high = high
+        self._filter_band = None
+
+    @staticmethod
+    def _design_fir_band_filter(
+        samplerate: int, hp_cutoff: float, lp_cutoff: float, num_taps: int = 63
+    ) -> np.ndarray:
+        nyquist = samplerate * 0.5
+        taps_index = np.arange(num_taps, dtype=np.float32) - (num_taps - 1) / 2.0
+        window = np.hamming(num_taps).astype(np.float32)
+
+        def lowpass(cutoff: float) -> np.ndarray:
+            norm = max(min(cutoff / nyquist, 0.999), 1e-6)
+            return (norm * np.sinc(norm * taps_index) * window).astype(np.float32)
+
+        if hp_cutoff <= 0.0:
+            taps = lowpass(lp_cutoff)
+        else:
+            low = lowpass(lp_cutoff)
+            high = lowpass(hp_cutoff)
+            taps = low - high
+
+        taps_sum = np.sum(taps)
+        if abs(taps_sum) > 1e-6:
+            taps = taps / taps_sum if hp_cutoff <= 0.0 else taps / np.sum(np.abs(taps))
+        return taps.astype(np.float32)
 
     @staticmethod
     def _db_to_percent(db: float, floor_db: float) -> float:
@@ -704,6 +733,33 @@ class DataCollector:
         alpha = 1.0 - np.exp(-max(dt, 1e-3) / tau)
         self._peak_level += (target - self._peak_level) * alpha
         return round(max(0.0, min(100.0, self._peak_level)), 2)
+
+    def apply_audio_band_filter(self, samples: np.ndarray, samplerate: int) -> np.ndarray:
+        """Apply a numpy FIR band-pass filter to audio samples."""
+        if samples.size == 0:
+            return samples
+        hp_cutoff = max(0.0, float(self._audio_freq_low))
+        lp_cutoff = min(float(self._audio_freq_high), samplerate * 0.45)
+        band = (round(hp_cutoff, 3), round(lp_cutoff, 3))
+
+        if (
+            self._filter_taps is None
+            or self._filter_state is None
+            or self._filter_samplerate != samplerate
+            or self._filter_band != band
+        ):
+            self._filter_taps = self._design_fir_band_filter(
+                samplerate, hp_cutoff, lp_cutoff
+            )
+            self._filter_state = np.zeros(len(self._filter_taps) - 1, dtype=np.float32)
+            self._filter_samplerate = samplerate
+            self._filter_band = band
+
+        x = np.asarray(samples, dtype=np.float32)
+        padded = np.concatenate((self._filter_state, x))
+        filtered = np.convolve(padded, self._filter_taps, mode="valid")
+        self._filter_state = padded[-(len(self._filter_taps) - 1):].copy()
+        return filtered.astype(np.float32, copy=False)
 
     def start(self, interval=1.0, metrics=None, callback=None):
         self.interval = interval
@@ -761,22 +817,10 @@ class DataCollector:
                     buf = rec.record(numframes=chunk_frames).flatten()
                     if buf.size == 0:
                         continue
-                    freq_low = self._audio_freq_low
-                    freq_high = self._audio_freq_high
-
-                    # Apply a Hamming window before the FFT to reduce spectral leakage.
-                    window = np.hamming(len(buf))
-                    window_rms = np.sqrt(np.mean(np.square(window))) or 1.0
-                    buf_win = (buf * window) / window_rms
-
-                    # FFT band-pass: keep only FREQ_LOW ~ FREQ_HIGH
-                    spectrum = np.fft.rfft(buf_win)
-                    freqs    = np.fft.rfftfreq(len(buf_win), d=1.0 / samplerate)
-                    spectrum[(freqs < freq_low) | (freqs > freq_high)] = 0
-                    bass     = np.fft.irfft(spectrum, len(buf_win))
+                    band = self.apply_audio_band_filter(buf, samplerate)
 
                     self._audio_level = self.compute_peak_level(
-                        bass, self._AUDIO_CHUNK_S
+                        band, len(band) / samplerate
                     )
 
                     # Drive the callback at audio rate.  Take a GIL-safe snapshot
