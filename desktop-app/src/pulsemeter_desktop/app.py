@@ -624,6 +624,10 @@ METRIC_KEYS = {v: k for k, v in METRIC_LABELS.items()}
 
 
 class DataCollector:
+    AUDIO_DB_MIN = -20.0
+    AUDIO_DB_MAX = 3.0
+    AUDIO_VU_REF_DBFS = -18.0
+
     def __init__(self):
         self.interval = None
         self.metrics: list[str] = []
@@ -637,10 +641,11 @@ class DataCollector:
         # The recorder is kept open permanently to eliminate per-iteration open overhead.
         self._audio_level: float = 0.0
         self._audio_gain: float = 1.0
+        self._audio_mode: str = "peak"
         self._audio_freq_low: float = 200.0
         self._audio_freq_high: float = 2000.0
-        self._vu_level: float = 0.0
-        self._peak_level: float = 0.0
+        self._audio_db: float = self.AUDIO_DB_MIN
+        self._audio_full_scale: float | None = None
         self._filter_samplerate: int | None = None
         self._filter_band: tuple[float, float] | None = None
         self._filter_taps: np.ndarray | None = None
@@ -661,6 +666,10 @@ class DataCollector:
             self._audio_gain = max(0.0, float(gain))
         except (TypeError, ValueError):
             self._audio_gain = 1.0
+
+    def set_audio_mode(self, mode: str):
+        mode = (mode or "").strip().lower()
+        self._audio_mode = mode if mode in {"peak", "rms"} else "peak"
 
     def set_audio_band(self, low: float, high: float):
         try:
@@ -698,41 +707,46 @@ class DataCollector:
             taps = taps / taps_sum if hp_cutoff <= 0.0 else taps / np.sum(np.abs(taps))
         return taps.astype(np.float32)
 
-    @staticmethod
-    def _db_to_percent(db: float, floor_db: float) -> float:
-        return max(0.0, min(100.0, (db - floor_db) / abs(floor_db) * 100.0))
+    def _sample_full_scale(self, samples: np.ndarray) -> float:
+        if self._audio_full_scale is not None:
+            return self._audio_full_scale
 
-    def compute_vu_level(self, samples: np.ndarray, dt: float) -> float:
-        """Return a VU-style level in the range 0-100."""
-        rms = float(np.sqrt(np.mean(np.square(samples)))) * self._audio_gain if samples.size else 0.0
-        if rms <= 1e-6:
-            target = 0.0
+        arr = np.asarray(samples)
+        if np.issubdtype(arr.dtype, np.integer):
+            info = np.iinfo(arr.dtype)
+            self._audio_full_scale = float(max(abs(info.min), info.max))
         else:
-            db = 20 * np.log10(rms)
-            target = 0.0 if db < -54.0 else self._db_to_percent(db, -48.0)
+            self._audio_full_scale = 1.0
+        return self._audio_full_scale
 
-        attack_s = 0.015
-        release_s = 0.05
-        tau = attack_s if target > self._vu_level else release_s
-        alpha = 1.0 - np.exp(-max(dt, 1e-3) / tau)
-        self._vu_level += (target - self._vu_level) * alpha
-        return round(max(0.0, min(100.0, self._vu_level)), 2)
+    def _compute_dbfs(self, samples: np.ndarray, mode: str) -> float:
+        arr = np.asarray(samples)
+        if arr.size == 0:
+            return float("-inf")
 
-    def compute_peak_level(self, samples: np.ndarray, dt: float) -> float:
-        """Return a peak-style level in the range 0-100."""
-        peak = float(np.max(np.abs(samples))) * self._audio_gain if samples.size else 0.0
-        if peak <= 1e-6:
-            target = 0.0
+        full_scale = self._sample_full_scale(arr)
+        if full_scale <= 0.0:
+            return float("-inf")
+
+        if mode == "peak":
+            magnitude = float(np.max(np.abs(arr)))
         else:
-            db = 20 * np.log10(peak)
-            target = 0.0 if db < -60.0 else self._db_to_percent(db, -42.0)
+            magnitude = float(np.sqrt(np.mean(np.square(arr))))
 
-        attack_s = 0.015
-        release_s = 0.05
-        tau = attack_s if target > self._peak_level else release_s
-        alpha = 1.0 - np.exp(-max(dt, 1e-3) / tau)
-        self._peak_level += (target - self._peak_level) * alpha
-        return round(max(0.0, min(100.0, self._peak_level)), 2)
+        if magnitude <= 1e-12:
+            return float("-inf")
+        return 20.0 * np.log10(magnitude / full_scale)
+
+    def compute_audio_db(self, samples: np.ndarray, dt: float, mode: str) -> float:
+        """Return the current audio level in dB for UI display and meter mapping."""
+        weighted = np.asarray(samples, dtype=np.float32) * self._audio_gain
+        dbfs = self._compute_dbfs(weighted, mode=mode)
+        if not np.isfinite(dbfs):
+            self._audio_db = self.AUDIO_DB_MIN
+        else:
+            self._audio_db = dbfs - self.AUDIO_VU_REF_DBFS
+            self._audio_db = max(self.AUDIO_DB_MIN, min(self.AUDIO_DB_MAX, self._audio_db))
+        return round(max(self.AUDIO_DB_MIN, min(self.AUDIO_DB_MAX, self._audio_db)), 2)
 
     def apply_audio_band_filter(self, samples: np.ndarray, samplerate: int) -> np.ndarray:
         """Apply a numpy FIR band-pass filter to audio samples."""
@@ -805,12 +819,6 @@ class DataCollector:
         # Fixed window regardless of the main loop interval
         chunk_frames = max(1, int(self._AUDIO_CHUNK_S * samplerate))
 
-        # Bass band: kick drum + bass guitar (60–300 Hz).
-        # Zeroing everything outside this range in the FFT removes cymbals,
-        # vocals and high-frequency noise that obscure the rhythmic beat signal.
-        # FREQ_LOW  = 200    # Hz — below this is rumble/DC
-        # FREQ_HIGH = 2000   # Hz — above this is mids/highs
-
         try:
             with self._mic.recorder(samplerate=samplerate, channels=1) as rec:
                 while not self._audio_stop.is_set():
@@ -818,11 +826,7 @@ class DataCollector:
                     if buf.size == 0:
                         continue
                     band = self.apply_audio_band_filter(buf, samplerate)
-
-                    self._audio_level = self.compute_peak_level(
-                        band, len(band) / samplerate
-                    )
-
+                    self._audio_level = self.compute_audio_db(band, len(band) / samplerate, self._audio_mode)
                     # Drive the callback at audio rate.  Take a GIL-safe snapshot
                     # of the non-audio cache and inject the fresh audio level so
                     # the sender and UI both update at _AUDIO_CHUNK_S (50 ms).
@@ -922,6 +926,14 @@ class MeterManager:
         """Convert a raw metric value to a 0-100 integer suitable for the TCP frame."""
         if isinstance(v, dict):
             return int(min(v.get('MB/s', 0.0) * 20.0, 100.0))
+        if metric == "audio":
+            try:
+                db = float(v)
+                span = DataCollector.AUDIO_DB_MAX - DataCollector.AUDIO_DB_MIN
+                pct = (db - DataCollector.AUDIO_DB_MIN) / span * 100.0
+                return max(0, min(100, int(round(pct))))
+            except (TypeError, ValueError, ZeroDivisionError):
+                return 0
         if metric == "time_hour":
             try:
                 return int(min(max(float(v), 0.0) / 23.0 * 100.0, 100.0))
@@ -968,6 +980,7 @@ class MeterManager:
         # _audio_level, so the main loop just does a non-blocking read.
         interval = 0.5
         self.collector.set_audio_gain(self.setting.systemsetting.audio_gain)
+        self.collector.set_audio_mode(self.setting.systemsetting.audio_mode)
         self.collector.set_audio_band(
             self.setting.systemsetting.audio_freq_low,
             self.setting.systemsetting.audio_freq_high,
@@ -1007,6 +1020,7 @@ class MeterManager:
         self.setting.systemsetting.meter1 = meter1
         self.setting.systemsetting.meter2 = meter2
         self.collector.set_audio_gain(self.setting.systemsetting.audio_gain)
+        self.collector.set_audio_mode(self.setting.systemsetting.audio_mode)
         self.collector.set_audio_band(
             self.setting.systemsetting.audio_freq_low,
             self.setting.systemsetting.audio_freq_high,
@@ -1175,14 +1189,32 @@ class SettingsWindow:
         tk.Frame(body, bg=THEME['border'], height=1).grid(
             row=2, column=0, columnspan=4, sticky='ew', pady=(4, 10))
 
-        # -- Section: AUDIO --
-        tk.Label(body, text="AUDIO", bg=THEME['bg'],
+        # -- Section: AUDIO VU --
+        tk.Label(body, text="AUDIO VU", bg=THEME['bg'],
                  fg=THEME['green'], font=FONT['section']).grid(
                      row=3, column=0, columnspan=4, sticky='w', pady=(0, 4))
 
-        tk.Label(body, text="Gain", bg=THEME['bg'],
+        tk.Label(body, text="Mode", bg=THEME['bg'],
                  fg=THEME['subtext'], font=FONT['small']).grid(
                      row=4, column=0, sticky='w', pady=6)
+
+        self._audio_mode_var = tk.StringVar(
+            value=(self._manager.setting.systemsetting.audio_mode or "peak").upper()
+        )
+        self._audio_mode_combo = ttk.Combobox(
+            body, values=["PEAK", "RMS"], width=10, state='readonly',
+            style='Dark.TCombobox', textvariable=self._audio_mode_var
+        )
+        self._audio_mode_combo.grid(row=4, column=1, padx=(8, 4), pady=6, sticky='ew')
+        self._audio_mode_combo.bind('<<ComboboxSelected>>', self._on_audio_mode_changed)
+
+        tk.Label(body, text="Meter method", bg=THEME['bg'],
+                 fg=THEME['border'], font=FONT['small']).grid(
+                     row=4, column=3, sticky='w', pady=6)
+
+        tk.Label(body, text="Gain", bg=THEME['bg'],
+                 fg=THEME['subtext'], font=FONT['small']).grid(
+                     row=5, column=0, sticky='w', pady=6)
 
         self._audio_gain_var = tk.DoubleVar(value=self._manager.setting.systemsetting.audio_gain)
         self._audio_gain_scale = ttk.Scale(
@@ -1190,21 +1222,21 @@ class SettingsWindow:
             variable=self._audio_gain_var, length=140,
             style='Modern.Horizontal.TScale',
             command=self._on_audio_gain_changed)
-        self._audio_gain_scale.grid(row=4, column=1, padx=(8, 4), pady=6, sticky='ew')
+        self._audio_gain_scale.grid(row=5, column=1, padx=(8, 4), pady=6, sticky='ew')
 
         self._audio_gain_value = tk.Label(
             body, text=f"{self._audio_gain_var.get():.1f}x",
             bg=THEME['card'], fg=THEME['text'], font=FONT['small'],
             padx=8, pady=2)
-        self._audio_gain_value.grid(row=4, column=2, sticky='w', pady=6)
+        self._audio_gain_value.grid(row=5, column=2, sticky='w', pady=6)
 
         tk.Label(body, text="Level multiplier", bg=THEME['bg'],
                  fg=THEME['border'], font=FONT['small']).grid(
-                     row=4, column=3, sticky='w', pady=6)
+                     row=5, column=3, sticky='w', pady=6)
 
         tk.Label(body, text="Low cut", bg=THEME['bg'],
                  fg=THEME['subtext'], font=FONT['small']).grid(
-                     row=5, column=0, sticky='w', pady=6)
+                     row=6, column=0, sticky='w', pady=6)
 
         self._audio_low_var = tk.DoubleVar(value=self._manager.setting.systemsetting.audio_freq_low)
         self._audio_low_scale = ttk.Scale(
@@ -1212,21 +1244,21 @@ class SettingsWindow:
             variable=self._audio_low_var, length=140,
             style='Modern.Horizontal.TScale',
             command=self._on_audio_low_changed)
-        self._audio_low_scale.grid(row=5, column=1, padx=(8, 4), pady=6, sticky='ew')
+        self._audio_low_scale.grid(row=6, column=1, padx=(8, 4), pady=6, sticky='ew')
 
         self._audio_low_value = tk.Label(
             body, text=f"{self._audio_low_var.get():.0f} Hz",
             bg=THEME['card'], fg=THEME['text'], font=FONT['small'],
             padx=8, pady=2)
-        self._audio_low_value.grid(row=5, column=2, sticky='w', pady=6)
+        self._audio_low_value.grid(row=6, column=2, sticky='w', pady=6)
 
         tk.Label(body, text="Band lower edge", bg=THEME['bg'],
                  fg=THEME['border'], font=FONT['small']).grid(
-                     row=5, column=3, sticky='w', pady=6)
+                     row=6, column=3, sticky='w', pady=6)
 
         tk.Label(body, text="High cut", bg=THEME['bg'],
                  fg=THEME['subtext'], font=FONT['small']).grid(
-                     row=6, column=0, sticky='w', pady=6)
+                     row=7, column=0, sticky='w', pady=6)
 
         self._audio_high_var = tk.DoubleVar(value=self._manager.setting.systemsetting.audio_freq_high)
         self._audio_high_scale = ttk.Scale(
@@ -1234,33 +1266,33 @@ class SettingsWindow:
             variable=self._audio_high_var, length=140,
             style='Modern.Horizontal.TScale',
             command=self._on_audio_high_changed)
-        self._audio_high_scale.grid(row=6, column=1, padx=(8, 4), pady=6, sticky='ew')
+        self._audio_high_scale.grid(row=7, column=1, padx=(8, 4), pady=6, sticky='ew')
 
         self._audio_high_value = tk.Label(
             body, text=f"{self._audio_high_var.get():.0f} Hz",
             bg=THEME['card'], fg=THEME['text'], font=FONT['small'],
             padx=8, pady=2)
-        self._audio_high_value.grid(row=6, column=2, sticky='w', pady=6)
+        self._audio_high_value.grid(row=7, column=2, sticky='w', pady=6)
 
         tk.Label(body, text="Band upper edge", bg=THEME['bg'],
                  fg=THEME['border'], font=FONT['small']).grid(
-                     row=6, column=3, sticky='w', pady=6)
+                     row=7, column=3, sticky='w', pady=6)
 
         # -- Separator --
         tk.Frame(body, bg=THEME['border'], height=1).grid(
-            row=7, column=0, columnspan=4, sticky='ew', pady=(4, 10))
+            row=8, column=0, columnspan=4, sticky='ew', pady=(4, 10))
 
         # -- Section: CALIBRATION --
         tk.Label(body, text="CALIBRATION", bg=THEME['bg'],
                  fg=THEME['accent2'], font=FONT['section']).grid(
-                     row=8, column=0, columnspan=3, sticky='w', pady=(0, 4))
+                     row=9, column=0, columnspan=3, sticky='w', pady=(0, 4))
 
         self._calib_btn = _HoverButton(
             body, text="鈻?Cal", bg=THEME['card'], hover_bg=THEME['border'],
             fg=THEME['accent2'], font=FONT['small'],
             relief='flat', cursor='hand2', width=7, padx=2,
             command=self._toggle_calibrate)
-        self._calib_btn.grid(row=8, column=3, pady=(0, 4))
+        self._calib_btn.grid(row=9, column=3, pady=(0, 4))
         self._refresh_calib_btn()
 
         for idx, (default, name) in enumerate([
@@ -1269,24 +1301,24 @@ class SettingsWindow:
         ]):
             tk.Label(body, text=name, bg=THEME['bg'],
                      fg=THEME['subtext'], font=FONT['small']).grid(
-                         row=9 + idx, column=0, sticky='w', pady=6)
+                         row=10 + idx, column=0, sticky='w', pady=6)
 
             spin = ttk.Spinbox(body, from_=1, to=4095, increment=1,
                                width=7, style='Dark.TSpinbox')
             spin.set(default)
-            spin.grid(row=9 + idx, column=1, padx=(8, 4), pady=6)
+            spin.grid(row=10 + idx, column=1, padx=(8, 4), pady=6)
 
             btn_r = _HoverButton(body, text="R", width=2,
                                  bg=THEME['card'], fg=THEME['accent'],
                                  font=FONT['small'], relief='flat', cursor='hand2',
                                  command=lambda i=idx+1, s=spin: self._read_duty(i, s))
-            btn_r.grid(row=9 + idx, column=2, padx=2)
+            btn_r.grid(row=10 + idx, column=2, padx=2)
 
             btn_w = _HoverButton(body, text="W", width=2,
                                  bg=THEME['card'], fg=THEME['accent2'],
                                  font=FONT['small'], relief='flat', cursor='hand2',
                                  command=lambda i=idx+1, s=spin: self._write_duty(i, s))
-            btn_w.grid(row=9 + idx, column=3, padx=2)
+            btn_w.grid(row=10 + idx, column=3, padx=2)
 
             if idx == 0:
                 self._spin1, self._btn1_r, self._btn1_w = spin, btn_r, btn_w
@@ -1369,6 +1401,11 @@ class SettingsWindow:
         self._audio_gain_value.config(text=f"{gain:.1f}x")
         self._manager.setting.systemsetting.audio_gain = gain
         self._manager.collector.set_audio_gain(gain)
+
+    def _on_audio_mode_changed(self, event=None):
+        mode = (self._audio_mode_var.get() or "PEAK").strip().lower()
+        self._manager.setting.systemsetting.audio_mode = mode
+        self._manager.collector.set_audio_mode(mode)
 
     def _apply_audio_band(self, low: float, high: float):
         low = round(float(low))
@@ -1814,6 +1851,14 @@ class PulseMeterApp:
                 return f"{f:.0f}", "s", min(max(f, 0.0) / 59.0 * 100.0, 100.0)
             except (TypeError, ValueError):
                 return "-", "", 0.0
+        if metric == "audio":
+            try:
+                db = float(v)
+                span = DataCollector.AUDIO_DB_MAX - DataCollector.AUDIO_DB_MIN
+                pct = (db - DataCollector.AUDIO_DB_MIN) / span * 100.0
+                return f"{db:.1f}", "dB", max(0.0, min(100.0, pct))
+            except (TypeError, ValueError, ZeroDivisionError):
+                return "-", "dB", 0.0
         try:
             f = float(v)
             return f"{f:.1f}", "%", f
