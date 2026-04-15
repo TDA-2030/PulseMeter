@@ -98,25 +98,25 @@ def draw_face(draw: ImageDraw.ImageDraw) -> None:
 
 def draw_labels(draw: ImageDraw.ImageDraw) -> None:
     font_large = scaled_font(["arial.ttf", "DejaVuSans.ttf"], 84)
-    font_num = scaled_font(["arial.ttf", "DejaVuSans.ttf"], 44)
+    font_num = scaled_font(["arialbd.ttf", "DejaVuSans-Bold.ttf"], 54)
     font_small = scaled_font(["arial.ttf", "DejaVuSans.ttf"], 21)
     font_logo = scaled_font(["arialbd.ttf", "Arial Bold.ttf", "DejaVuSans-Bold.ttf"], 38)
     font_model = scaled_font(["arial.ttf", "DejaVuSans.ttf"], 42)
 
-    draw_text(draw, (123, 112), "A", font_large)
+    # draw_text(draw, (123, 112), "A", font_large)
 
     number_positions = {
-        "0": (162, 611),
-        "50": (193, 478),
-        "100": (305, 307),
-        "150": (463, 174),
-        "200": (617, 169),
+        "0": (136, 611),
+        "25": (166, 478),
+        "50": (282, 288),
+        "75": (443, 174),
+        "100": (617, 143),
     }
     for text, xy in number_positions.items():
         draw_text(draw, xy, text, font_num)
 
     # Manufacturer mark and model block.
-    draw_text(draw, (633, 330), "PulseMeter", font_logo)
+    # draw_text(draw, (633, 330), "PulseMeter", font_logo)
 
 
 def draw_body_cutout(draw: ImageDraw.ImageDraw) -> None:
@@ -150,7 +150,7 @@ def draw_body_cutout(draw: ImageDraw.ImageDraw) -> None:
 
 
 def draw_screws(draw: ImageDraw.ImageDraw) -> None:
-    for x, y, r in ((690, 417, 14), (417, 690, 14)):
+    for x, y, r in ((690, 417, 6), (417, 690, 6)):
         draw.ellipse(
             ((x - r) * SCALE, (y - r) * SCALE, (x + r) * SCALE, (y + r) * SCALE),
             fill=INK,
