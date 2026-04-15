@@ -636,7 +636,6 @@ class DataCollector:
         self._thread = None
         self._prev_net = psutil.net_io_counters()
         self._prev_disk = psutil.disk_io_counters()
-        self._mic = sc.get_microphone(id=str(sc.default_speaker().name), include_loopback=True)
         # Audio is sampled in a dedicated thread to avoid blocking the main loop.
         # The recorder is kept open permanently to eliminate per-iteration open overhead.
         self._audio_level: float = 0.0
@@ -652,6 +651,7 @@ class DataCollector:
         self._filter_state: np.ndarray | None = None
         self._audio_stop = threading.Event()
         self._audio_thread: threading.Thread | None = None
+        self._audio_device_poll_s: float = 1.0
         # Cache of the last non-audio data frame.  Written by _run() at 0.5 s;
         # read by _audio_loop() so it can assemble a complete dict at 50 ms rate.
         # Dict reference replacement is atomic under the GIL, so no extra lock needed.
@@ -775,6 +775,23 @@ class DataCollector:
         self._filter_state = padded[-(len(self._filter_taps) - 1):].copy()
         return filtered.astype(np.float32, copy=False)
 
+    def _get_loopback_microphone(self):
+        speaker = sc.default_speaker()
+        if speaker is None:
+            raise RuntimeError("No default speaker available for loopback capture")
+        return sc.get_microphone(id=str(speaker.name), include_loopback=True)
+
+    def _get_default_speaker_name(self) -> str:
+        speaker = sc.default_speaker()
+        if speaker is None:
+            raise RuntimeError("No default speaker available for loopback capture")
+        return str(speaker.name)
+
+    def _reset_audio_filter_state(self):
+        self._filter_state = None
+        self._filter_samplerate = None
+        self._filter_band = None
+
     def start(self, interval=1.0, metrics=None, callback=None):
         self.interval = interval
         self.metrics = metrics
@@ -819,23 +836,49 @@ class DataCollector:
         # Fixed window regardless of the main loop interval
         chunk_frames = max(1, int(self._AUDIO_CHUNK_S * samplerate))
 
-        try:
-            with self._mic.recorder(samplerate=samplerate, channels=1) as rec:
-                while not self._audio_stop.is_set():
-                    buf = rec.record(numframes=chunk_frames).flatten()
-                    if buf.size == 0:
-                        continue
-                    band = self.apply_audio_band_filter(buf, samplerate)
-                    self._audio_level = self.compute_audio_db(band, len(band) / samplerate, self._audio_mode)
-                    # Drive the callback at audio rate.  Take a GIL-safe snapshot
-                    # of the non-audio cache and inject the fresh audio level so
-                    # the sender and UI both update at _AUDIO_CHUNK_S (50 ms).
-                    if self.callback:
-                        data = dict(self._non_audio_cache)
-                        data['audio'] = self._audio_level
-                        self.callback(data)
-        except Exception:
-            traceback.print_exc()
+        while not self._audio_stop.is_set():
+            try:
+                mic = self._get_loopback_microphone()
+                current_device_name = str(mic.name)
+                next_device_poll = time.monotonic() + self._audio_device_poll_s
+                self._reset_audio_filter_state()
+                print(f"[audio] Using loopback device: {current_device_name}")
+                with mic.recorder(samplerate=samplerate, channels=1) as rec:
+                    while not self._audio_stop.is_set():
+                        now = time.monotonic()
+                        if now >= next_device_poll:
+                            next_device_poll = now + self._audio_device_poll_s
+                            default_device_name = self._get_default_speaker_name()
+                            if default_device_name != current_device_name:
+                                print(
+                                    "[audio] Default speaker changed: "
+                                    f"{current_device_name} -> {default_device_name}"
+                                )
+                                break
+                        buf = rec.record(numframes=chunk_frames).flatten()
+                        if buf.size == 0:
+                            continue
+                        band = self.apply_audio_band_filter(buf, samplerate)
+                        self._audio_level = self.compute_audio_db(
+                            band, len(band) / samplerate, self._audio_mode
+                        )
+                        # Drive the callback at audio rate.  Take a GIL-safe snapshot
+                        # of the non-audio cache and inject the fresh audio level so
+                        # the sender and UI both update at _AUDIO_CHUNK_S (50 ms).
+                        if self.callback:
+                            data = dict(self._non_audio_cache)
+                            data['audio'] = self._audio_level
+                            self.callback(data)
+            except RuntimeError as e:
+                print(f"[audio] Loopback capture failed, retrying: {e}")
+                self._audio_level = self.AUDIO_DB_MIN
+                if self._audio_stop.wait(1.0):
+                    break
+            except Exception:
+                traceback.print_exc()
+                self._audio_level = self.AUDIO_DB_MIN
+                if self._audio_stop.wait(1.0):
+                    break
 
     def _run(self):
         # Pre-warm cpu_percent so the first real sample isn't always 0.0
