@@ -7,6 +7,7 @@
 #include "esp_wifi.h"
 #include "esp_netif.h"
 #include "esp_mac.h"
+#include "nvs_flash.h"
 
 #include "../cgi/cgiwifi.h"
 #include "../adapt/esp32_wifi.h"
@@ -52,6 +53,18 @@ static TaskHandle_t g_staConnectHandle;
 static void httpdRedirect(httpd_req_t *req, const char *newUrl);
 static bool is_portal_html_uri(const char *uri);
 static bool is_redirect_probe_uri(const char *uri);
+static esp_err_t clear_sta_config_from_flash(void);
+
+static esp_err_t clear_sta_config_from_flash(void)
+{
+    wifi_config_t empty_cfg = {0};
+    ESP_ERROR_CHECK(nvs_flash_erase());
+
+    g_wifi_config_saved = empty_cfg;
+    g_wifi_config_pending = empty_cfg;
+    ESP_LOGI(TAG, "Cleared STA config from flash after connection failure.");
+    return ESP_OK;
+}
 
 // --------------------------------------------------------------------------
 // taken from MightyPork/libesphttpd
@@ -542,7 +555,7 @@ static void staWiFiDoConnect(void *arg)
         mode = WIFI_MODE_STA;
     }
 
-    esp_wifi_set_storage(WIFI_STORAGE_RAM);
+    esp_wifi_set_storage(WIFI_STORAGE_FLASH);
     wifiSetConfig(WIFI_IF_STA, &g_wifi_config_pending);
 
     ESP_LOGD(TAG, "Connect....");
@@ -622,11 +635,18 @@ esp_err_t cgiWiFiConnStatus(httpd_req_t *req)
             esp_netif_ip_info_t ipInfo;
             esp_netif_get_ip_info(esp_netif_get_handle_from_ifkey("WIFI_STA_DEF"), &ipInfo);
             len = sprintf(buff, "{\"status\": \"success\", \"ip\": \"" IPSTR "\"}", GOOD_IP2STR(ipInfo.ip.addr));
+        } else if (bits & WIFI_STA_DISCONNECT) {
+            ESP_ERROR_CHECK(esp_wifi_disconnect());
+            ESP_LOGW(TAG, "STA disconnected while waiting for provisioning result; mark config as failed.");
+            clear_sta_config_from_flash();
+            g_connTryStatus = CONNTRY_FAIL;
+            len = sprintf(buff, "{ \"status\": \"fail\" }");
         } else {
             len = sprintf(buff, "{ \"status\": \"working\" }");
         }
     } else {
         len = sprintf(buff, "{ \"status\": \"fail\" }");
+        clear_sta_config_from_flash();
     }
 
     ESP_LOGI(TAG, "Upload WiFi connect status: %s", buff);
@@ -658,7 +678,6 @@ esp_err_t cgiWiFiConfigSuccess(httpd_req_t *req)
         // if receiced wifi config success status from client, set WiFi operating mode as only STA mode.
         if (strncmp(config_status, "success", strlen("success")) == 0) {
             ESP_LOGI(TAG, "WiFi config success, set WiFi operating mode as only STA mode.");
-            esp_wifi_set_storage(WIFI_STORAGE_FLASH);
             wifiSetConfig(WIFI_IF_STA, &g_wifi_config_pending);
             wifiSetNewMode(WIFI_MODE_STA);
             esp_event_post(APP_NETWORK_EVENT, APP_NETWORK_EVENT_CONFIG_SUCCESS, NULL, 0, portMAX_DELAY);
