@@ -338,15 +338,17 @@ class DataSender:
     streaming and async RPC can coexist on the same socket.
     """
 
-    def __init__(self):
+    def __init__(self, on_disconnect=None):
         self.sock = None
         self.host = None
         self.port = None
+        self.on_disconnect = on_disconnect
         self._seq = 0
         self._seq_lock = threading.Lock()
         self._pending: dict = {}          # seq → {'event': Event, 'result': ...}
         self._pending_lock = threading.Lock()
         self._send_lock = threading.Lock()
+        self._state_lock = threading.Lock()
         self._recv_thread = None
         self._stop_recv = threading.Event()
 
@@ -357,13 +359,17 @@ class DataSender:
     def connect(self, host: str, port: int, timeout: float = 2.0) -> bool:
         self.host = host
         self.port = port
+        self.close(notify=False)
+        sock = None
         try:
             print(f"[TCP] Connecting to {host}:{port}")
-            self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            self.sock.settimeout(timeout)
-            self.sock.connect((host, port))
-            self.sock.settimeout(None)  # blocking mode for recv thread
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            sock.settimeout(timeout)
+            sock.connect((host, port))
+            sock.settimeout(None)  # blocking mode for recv thread
+            with self._state_lock:
+                self.sock = sock
             self._stop_recv.clear()
             self._recv_thread = threading.Thread(
                 target=self._recv_loop, daemon=True, name="DataSender-recv")
@@ -371,28 +377,43 @@ class DataSender:
             return True
         except Exception as e:
             print(f"[TCP] Connection failed: {e}")
-            self.sock = None
+            if sock is not None:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+            with self._state_lock:
+                self.sock = None
             return False
 
-    def close(self):
+    def close(self, notify: bool = False, reason: str = "closed"):
         self._stop_recv.set()
-        if self.sock:
+        with self._state_lock:
+            sock = self.sock
+            self.sock = None
+        if sock:
             try:
                 # shutdown(SHUT_RDWR) does two things atomically:
                 #   SHUT_WR — sends FIN immediately, remote recv() returns 0
                 #   SHUT_RD — unblocks the recv thread's blocking recv() call
                 # plain close() alone does neither reliably while another
                 # thread is blocked in recv().
-                self.sock.shutdown(socket.SHUT_RDWR)
+                sock.shutdown(socket.SHUT_RDWR)
             except OSError:
                 pass
             try:
-                self.sock.close()
+                sock.close()
             except OSError:
                 pass
-        self.sock = None
-        if self._recv_thread and self._recv_thread.is_alive():
+        self._wake_pending()
+        if (
+            self._recv_thread
+            and self._recv_thread.is_alive()
+            and threading.current_thread() is not self._recv_thread
+        ):
             self._recv_thread.join(timeout=2)
+        if notify:
+            self._notify_disconnect(reason)
 
     # ------------------------------------------------------------------
     # Public API
@@ -474,22 +495,47 @@ class DataSender:
             return self._seq
 
     def _send_raw(self, data: bytes) -> bool:
-        if not self.sock:
+        with self._state_lock:
+            sock = self.sock
+        if not sock:
             return False
         try:
             with self._send_lock:
-                self.sock.sendall(data)
+                sock.sendall(data)
             return True
         except Exception as e:
             print(f"[TCP] Send failed: {e}")
+            self.close(notify=True, reason=f"send failed: {e}")
             return False
+
+    def _wake_pending(self):
+        with self._pending_lock:
+            pending = list(self._pending.values())
+            self._pending.clear()
+        for entry in pending:
+            entry['result'] = None
+            entry['event'].set()
+
+    def _notify_disconnect(self, reason: str):
+        if not self.on_disconnect:
+            return
+        threading.Thread(
+            target=self.on_disconnect,
+            args=(reason,),
+            daemon=True,
+            name="DataSender-disconnect",
+        ).start()
 
     def _recv_exact(self, n: int):
         """Read exactly n bytes from the socket, or return None on error."""
         data = b''
         while len(data) < n:
             try:
-                chunk = self.sock.recv(n - len(data))
+                with self._state_lock:
+                    sock = self.sock
+                if not sock:
+                    return None
+                chunk = sock.recv(n - len(data))
                 if not chunk:
                     return None
                 data += chunk
@@ -499,24 +545,30 @@ class DataSender:
 
     def _recv_loop(self):
         """Background thread: parse inbound frames, dispatch responses."""
-        while not self._stop_recv.is_set() and self.sock:
+        disconnect_reason = None
+        while not self._stop_recv.is_set():
             header = self._recv_exact(Protocol.HEADER_SIZE)
             if header is None:
-                print("[TCP] Recv: connection closed")
+                if not self._stop_recv.is_set():
+                    print("[TCP] Recv: connection closed")
+                    disconnect_reason = "connection closed"
                 break
 
             magic0, magic1, type_, seq, length = struct.unpack("!BBBBH", header)
             if magic0 != Protocol.MAGIC0 or magic1 != Protocol.MAGIC1:
                 print(f"[TCP] Recv: bad magic 0x{magic0:02X} 0x{magic1:02X}")
+                disconnect_reason = "bad protocol frame"
                 break
 
             payload = self._recv_exact(length) if length > 0 else b''
             if payload is None:
                 print("[TCP] Recv: lost payload")
+                disconnect_reason = "lost payload"
                 break
 
             crc_byte = self._recv_exact(1)
             if crc_byte is None:
+                disconnect_reason = "lost crc"
                 break
 
             crc_rx   = crc_byte[0]
@@ -533,6 +585,8 @@ class DataSender:
                     entry['event'].set()
                 else:
                     print(f"[TCP] Recv: no pending request for seq={seq}")
+        if disconnect_reason:
+            self.close(notify=True, reason=disconnect_reason)
 
 
 class SubnetDeviceScanner:
@@ -957,12 +1011,14 @@ class DataCollector:
 # -------------------- 浠〃绠＄悊绫?--------------------
 class MeterManager:
     def __init__(self):
-        self.sender = DataSender()
+        self.sender = DataSender(on_disconnect=self._handle_sender_disconnect)
         self.setting = Setting()
         self.collector = DataCollector()
         self.extra_display_callback = None
+        self.disconnect_callback = None
         self.is_running = False
         self._calibrating = False   # when True, override output with 100/100
+        self._state_lock = threading.Lock()
 
     @staticmethod
     def _to_pct(metric: str, v) -> int:
@@ -1004,12 +1060,14 @@ class MeterManager:
             data2 = data.get(metrics[1], 0)
             if self._calibrating:
                 # Send full-scale values so the needle visually reaches max_duty
-                self.sender.send_data(100, 100)
+                ok = self.sender.send_data(100, 100)
             else:
                 pct1 = self._to_pct(metrics[0], data1)
                 pct2 = self._to_pct(metrics[1], data2)
                 # print(f"[CPU] Sending data: {pct1}, {pct2}")
-                self.sender.send_data(pct1, pct2)
+                ok = self.sender.send_data(pct1, pct2)
+            if not ok:
+                return
             if self.extra_display_callback:
                 self.extra_display_callback(data1, data2)
         except Exception as e:
@@ -1037,7 +1095,8 @@ class MeterManager:
             self.sender.close()
             return False
         self.collector.start(interval, metrics=metrics, callback=self.data_cb)
-        self.is_running = True
+        with self._state_lock:
+            self.is_running = True
         return True
 
     def start_calibration(self):
@@ -1074,15 +1133,33 @@ class MeterManager:
         self.collector.start(interval, metrics=metrics, callback=self.data_cb)
 
     def stop(self):
+        with self._state_lock:
+            was_running = self.is_running
+            self.is_running = False
         self._calibrating = False
         print("[APP] Stopped MeterManager")
         self.collector.stop()
-        self.sender.send_data(0, 0)
+        if was_running:
+            self.sender.send_data(0, 0)
         self.sender.close()
-        self.is_running = False
 
     def set_extra_display_callback(self, callback):
         self.extra_display_callback = callback
+
+    def set_disconnect_callback(self, callback):
+        self.disconnect_callback = callback
+
+    def _handle_sender_disconnect(self, reason: str):
+        with self._state_lock:
+            if not self.is_running:
+                return
+            self.is_running = False
+        print(f"[APP] TCP disconnected: {reason}")
+        self._calibrating = False
+        self.collector.stop()
+        self.extra_display_callback = None
+        if self.disconnect_callback:
+            self.disconnect_callback(reason)
 
 
 # -------------------- Theme --------------------
@@ -1553,9 +1630,13 @@ class PulseMeterApp:
         self._connecting     = False
         self._scan_after_id  = None
         self._scan_token     = 0
+        self._reconnect_after_id = None
+        self._reconnect_host = None
+        self._reconnect_delay_ms = 3000
 
         self._configure_styles()
         self._build_ui()
+        self.manager.set_disconnect_callback(self._on_manager_disconnect)
 
         # mDNS device discovery
         self.discovery = DeviceDiscovery()
@@ -1761,12 +1842,42 @@ class PulseMeterApp:
             except tk.TclError:
                 self._settings_win = None
 
+    def _cancel_reconnect(self):
+        if self._reconnect_after_id is None:
+            return
+        try:
+            self.root.after_cancel(self._reconnect_after_id)
+        except tk.TclError:
+            pass
+        self._reconnect_after_id = None
+
+    def _schedule_reconnect(self, host: str, reason: str):
+        host = (host or "").strip()
+        if not host:
+            return
+        self._cancel_reconnect()
+        self._reconnect_host = host
+        print(f"[APP] Scheduling reconnect to {host} in 3s ({reason})")
+        self._set_hint_status(f"Disconnected, retrying {host} in 3s...", THEME['yellow'])
+        self._reconnect_after_id = self.root.after(
+            self._reconnect_delay_ms,
+            lambda: self._run_scheduled_reconnect(host),
+        )
+
+    def _run_scheduled_reconnect(self, host: str):
+        self._reconnect_after_id = None
+        if self.manager.is_running or self._is_connecting():
+            return
+        self._set_hint_status(f"Reconnecting to {host}...", THEME['yellow'])
+        self._connect_to_host(host, source="auto-reconnect")
+
     def _connect_to_host(self, host: str, source: str):
         host = (host or "").strip()
         if not host:
             return
         if self.manager.is_running or self._is_connecting():
             return
+        self._cancel_reconnect()
 
         meter1 = METRIC_KEYS.get(self.combo1.get(), self.combo1.get())
         meter2 = METRIC_KEYS.get(self.combo2.get(), self.combo2.get())
@@ -1782,6 +1893,7 @@ class PulseMeterApp:
             def done():
                 self._set_connecting(False)
                 if ok:
+                    self._reconnect_host = host
                     self.manager.setting.save(self.manager.setting.save_filename)
                     self.manager.set_extra_display_callback(self.update_meter_label)
                     self._set_connected(True)
@@ -1793,6 +1905,8 @@ class PulseMeterApp:
                     self._set_connected(False)
                     self._set_hint_status(f"Connect failed: {host}", THEME['red'])
                     print(f"[APP] connect failed via {source}: {host}")
+                    if source == "auto-reconnect":
+                        self._schedule_reconnect(host, "connect failed")
                     if source != "manual" and not self._discovered_ips:
                         self._schedule_fallback_scan(delay_ms=500)
 
@@ -1859,6 +1973,19 @@ class PulseMeterApp:
                 print(f"[mDNS] Single device @ {ips[0]} — auto-connecting")
                 self._set_hint_status(f"mDNS found device: {ips[0]}", THEME['green'])
                 self._connect_to_host(ips[0], source="mdns")
+
+        self.root.after(0, update)
+
+    def _on_manager_disconnect(self, reason: str):
+        def update():
+            self.manager.set_extra_display_callback(None)
+            self._set_connecting(False)
+            self._set_connected(False)
+            host = (self.manager.setting.systemsetting.server_ip or "").strip()
+            if host:
+                self._schedule_reconnect(host, reason)
+            else:
+                self._set_hint_status(f"Disconnected: {reason}", THEME['red'])
 
         self.root.after(0, update)
 
@@ -1987,6 +2114,7 @@ class PulseMeterApp:
 
     def toggle_start(self):
         if self.manager.is_running:
+            self._cancel_reconnect()
             self.manager.stop()
             self.manager.set_extra_display_callback(None)
             self._set_connected(False)
