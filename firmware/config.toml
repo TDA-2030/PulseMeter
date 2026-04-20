@@ -1,0 +1,12 @@
+esp_toml_version = 1.0
+firmware_images_url = "https://files.catbox.moe/"
+supported_apps = ["PulseMeter"]
+
+[PulseMeter]
+android_app_url = ""
+ios_app_url = ""
+readme.text = "https://raw.githubusercontent.com/TDA-2030/PulseMeter/refs/heads/master/README.md"
+description = "PulseMeter"
+image.esp32c3 = "7xz0vo.bin"
+chipsets = ["esp32c3"]
+
