@@ -1,22 +1,10 @@
-/* HTTP Restful API Server Example
-
-   This example code is in the Public Domain (or CC0 licensed, at your option.)
-
-   Unless required by applicable law or agreed to in writing, this
-   software is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
-   CONDITIONS OF ANY KIND, either express or implied.
-*/
-#include "sdkconfig.h"
-#include "driver/gpio.h"
-#include "esp_vfs_semihost.h"
-#include "esp_vfs_fat.h"
-#include "esp_spiffs.h"
-#include "sdmmc_cmd.h"
+#include <string.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "nvs_flash.h"
 #include "esp_netif.h"
 #include "esp_event.h"
 #include "esp_log.h"
-#include "freertos/task.h"
 #include "mdns.h"
 #include "lwip/apps/netbiosns.h"
 #include "lwip/inet.h"
@@ -24,12 +12,13 @@
 #include "esp_wifi.h"
 #include "captive_portal.h"
 #include "adapt/esp32_wifi.h"
-#if CONFIG_EXAMPLE_WEB_DEPLOY_SD
-#include "driver/sdmmc_host.h"
-#endif
 #include "meter_dial.h"
 
-#define MDNS_INSTANCE "esp home web server"
+#ifndef CONFIG_EXAMPLE_MDNS_HOST_NAME
+#define CONFIG_EXAMPLE_MDNS_HOST_NAME "pulsemeter"
+#endif
+
+#define MDNS_INSTANCE "esp pulsemeter server"
 
 static const char *TAG = "web";
 
@@ -142,13 +131,13 @@ static void event_handler(void *arg, esp_event_base_t event_base,
     }
 }
 
-void start_web(void)
+void start_wifi(void)
 {
     meters[0].set_percent(50);
     meters[1].set_percent(50);
     bool is_configured;
     ESP_LOGI(TAG, "Setup Wifi ...");
-    wifiIinitialize("PulseMeter", "", &is_configured);
+    wifiIinitialize(CONFIG_PULSEMETER_WIFI_AP_SSID, "", &is_configured);
     ESP_ERROR_CHECK(esp_event_handler_register(APP_NETWORK_EVENT, ESP_EVENT_ANY_ID, &event_handler, NULL));
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, ESP_EVENT_ANY_ID, &event_handler, NULL));
     if (is_configured) {

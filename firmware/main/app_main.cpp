@@ -6,7 +6,7 @@
 #include "nvs_flash.h"
 #include "helper.h"
 #include "setting.h"
-#include "web.h"
+#include "wifi.h"
 #include "board.h"
 #include "meter_dial.h"
 #include "meter_server.h"
@@ -32,7 +32,7 @@ extern "C" void app_main()
 
     g_settings.load();
     vTaskDelay(pdMS_TO_TICKS(100));
-    bsp_i2c_init();
+    board_init();
 
     /** Determine whether to restore the settings by reading the restart count */
     int restart_cnt = restart_count_get();
@@ -51,6 +51,6 @@ extern "C" void app_main()
     meters[0].waitSelfTestDone();
     meters[1].waitSelfTestDone();
 
-    start_web();
+    start_wifi();
     server.startServer();
 }

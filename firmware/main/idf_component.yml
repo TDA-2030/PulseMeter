@@ -1,7 +1,6 @@
 ## IDF Component Manager Manifest File
 dependencies:
   espressif/mdns: ^1.0.3
-  espressif/i2c_bus: "*"
   ## Required IDF version
   idf:
-    version: '>=5.0'
+    version: '>=5.4'

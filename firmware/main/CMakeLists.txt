@@ -7,7 +7,6 @@ idf_component_register(SRCS
 
     INCLUDE_DIRS 
     . 
-    wifi
 )
 
 target_compile_options(${COMPONENT_LIB} PRIVATE -Wno-format -Wno-empty-body -Wno-error=jump-misses-init)

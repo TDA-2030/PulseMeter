@@ -1,0 +1,35 @@
+name: Build Firmware
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - master
+      - main
+    paths:
+      - ".github/workflows/build-firmware.yml"
+      - "firmware/**"
+
+jobs:
+  build:
+    name: Build ESP32-C3 Firmware
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Build firmware with ESP-IDF
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: v5.5
+          target: esp32c3
+          path: firmware
+          command: idf.py build && idf.py merge-bin -o build/PulseMeter-esp32c3-merged.bin -f raw
+
+      - name: Upload merged firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: PulseMeter-firmware-esp32c3
+          path: firmware/build/PulseMeter-esp32c3-merged.bin
+          if-no-files-found: error

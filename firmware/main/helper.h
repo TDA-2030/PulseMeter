@@ -4,13 +4,15 @@
 #ifndef _HELPER_H_
 #define _HELPER_H_
 
+#include "sdkconfig.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 #define __HERE() printf("%s:%d - %s\n", __FILE__, __LINE__, __func__)
 
-#define RESTART_COUNT_RESET 5
+#define RESTART_COUNT_RESET CONFIG_PULSEMETER_RESTART_COUNT_RESET
 
 esp_err_t iot_param_save(const char* space_name, const char* key, void *param, uint16_t len);
 
