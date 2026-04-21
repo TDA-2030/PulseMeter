@@ -5,6 +5,7 @@
 #include "esp_log.h"
 #include "meter_server.h"
 #include "meter_dial.h"
+#include "firmware_version.h"
 #include "setting.h"
 
 static const char *TAG = "MeterServer";
@@ -254,6 +255,9 @@ void MeterServer::handleReadReq(uint8_t seq, const uint8_t *payload, uint16_t le
     case PARAM_MODE:
         value = g_settings.mode;
         break;
+    case PARAM_FIRMWARE_VERSION:
+        value = FIRMWARE_VERSION_U32;
+        break;
     case PARAM_METER1_VALUE:
         value = meter_value_[0];
         break;
@@ -304,6 +308,7 @@ void MeterServer::handleWriteReq(uint8_t seq, const uint8_t *payload, uint16_t l
         g_settings.mode = (uint8_t)value;
         g_settings.save();
         break;
+    case PARAM_FIRMWARE_VERSION:
     case PARAM_METER1_VALUE:
     case PARAM_METER2_VALUE:
         status = PROTO_STATUS_ERR;  // read-only

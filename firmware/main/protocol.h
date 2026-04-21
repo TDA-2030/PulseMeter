@@ -24,6 +24,9 @@
 #define PARAM_METER1_VALUE     0x0010  // uint8,  ro — current percent 0-100
 #define PARAM_METER2_VALUE     0x0011  // uint8,  ro — current percent 0-100
 
+// Additional read-only parameter IDs
+#define PARAM_FIRMWARE_VERSION 0x0004  // uint32, ro - 0x00MMmmpp (major/minor/patch)
+
 // Frame layout constants
 #define PROTO_HEADER_SIZE  6   // magic(2) + type(1) + seq(1) + len(2 big-endian)
 #define PROTO_CRC_SIZE     1

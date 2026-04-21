@@ -272,6 +272,7 @@ class Protocol:
     PARAM_METER1_MAX_DUTY = 0x0001
     PARAM_METER2_MAX_DUTY = 0x0002
     PARAM_MODE            = 0x0003
+    PARAM_FIRMWARE_VERSION = 0x0004  # read-only, packed as 0x00MMmmpp
     PARAM_METER1_VALUE    = 0x0010  # read-only
     PARAM_METER2_VALUE    = 0x0011  # read-only
 

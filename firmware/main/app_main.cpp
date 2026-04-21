@@ -8,6 +8,7 @@
 #include "setting.h"
 #include "wifi.h"
 #include "board.h"
+#include "firmware_version.h"
 #include "meter_dial.h"
 #include "meter_server.h"
 
@@ -22,6 +23,8 @@ MeterServer server;
 
 extern "C" void app_main()
 {
+    ESP_LOGI(TAG, "Starting PulseMeter firmware v%s", FIRMWARE_VERSION_STRING);
+
     /* Initialize NVS. */
     esp_err_t err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
