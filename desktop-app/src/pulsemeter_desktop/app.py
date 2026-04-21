@@ -1,5 +1,5 @@
 import tkinter as tk
-from tkinter import ttk
+from tkinter import messagebox, ttk
 import sys
 import time
 import os
@@ -695,8 +695,8 @@ METRIC_KEYS = {v: k for k, v in METRIC_LABELS.items()}
 
 
 class DataCollector:
-    AUDIO_DB_MIN = -20.0
-    AUDIO_DB_MAX = 3.0
+    AUDIO_DB_MIN = -40.0
+    AUDIO_DB_MAX = 5.0
     AUDIO_VU_REF_DBFS = -18.0
 
     def __init__(self):
@@ -1356,7 +1356,7 @@ class SettingsWindow:
 
         self._audio_gain_var = tk.DoubleVar(value=self._manager.setting.systemsetting.audio_gain)
         self._audio_gain_scale = ttk.Scale(
-            body, from_=0.0, to=20.0,
+            body, from_=0.0, to=5.0,
             variable=self._audio_gain_var, length=140,
             style='Modern.Horizontal.TScale',
             command=self._on_audio_gain_changed)
@@ -1567,6 +1567,8 @@ class SettingsWindow:
             self._calib_btn._normal_bg = THEME['card']
 
     def _rescan(self):
+        if self._manager.is_running or self._app._is_connecting():
+            return
         self._ip_combo['values'] = []
         self._app._rescan_devices()
 
@@ -2001,7 +2003,7 @@ class PulseMeterApp:
         found = self.subnet_scanner.scan()
 
         def done():
-            if token != self._scan_token or self.manager.is_running:
+            if token != self._scan_token or self.manager.is_running or self._is_connecting():
                 return
             self._refresh_ip_targets(found)
             if len(found) == 1:
@@ -2046,6 +2048,9 @@ class PulseMeterApp:
 
     def _rescan_devices(self):
         """Restart mDNS discovery and clear stale device list."""
+        if self.manager.is_running or self._is_connecting():
+            self._set_hint_status("Disconnect before rescanning devices", THEME['yellow'])
+            return
         self._discovered_ips = []
         self._set_hint_status("Rescanning devices...", THEME['yellow'])
         self.discovery.start()
@@ -2215,6 +2220,13 @@ def main() -> None:
     instance_lock = SingleInstanceLock(APP_NAME)
     if not instance_lock.acquire():
         print(f"{APP_NAME} is already running.")
+        root = tk.Tk()
+        try:
+            root.withdraw()
+            _apply_window_icon(root)
+            messagebox.showwarning(APP_NAME, f"{APP_NAME} is already running.")
+        finally:
+            root.destroy()
         sys.exit(0)
 
     root = tk.Tk()
