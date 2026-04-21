@@ -1,6 +1,6 @@
 [project]
 name = "pulsemeter-desktop"
-version = "0.1.0"
+version = "0.7.0"
 description = "Desktop companion app for the PulseMeter hardware meter"
 readme = "README.md"
 license = { text = "MIT" }

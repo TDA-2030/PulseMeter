@@ -11,6 +11,7 @@ import socket
 import struct
 import ipaddress
 import concurrent.futures
+from importlib.metadata import PackageNotFoundError, version as package_version
 import psutil
 import numpy as np
 import soundcard as sc
@@ -35,6 +36,21 @@ else:
 
 ROOT = PACKAGE_ROOT
 print(f"ROOT: {ROOT}")
+
+try:
+    APP_VERSION = package_version("pulsemeter-desktop")
+except PackageNotFoundError:
+    APP_VERSION = "0.7.0"
+
+
+def decode_packed_version(value: int | None) -> str:
+    """Decode 0x00MMmmpp into a dotted semantic version string."""
+    if value is None:
+        return "Not connected"
+    major = (value >> 16) & 0xFF
+    minor = (value >> 8) & 0xFF
+    patch = value & 0xFF
+    return f"{major}.{minor}.{patch}"
 
 # ---------- Bundled font loader ----------
 # Drop any TTF/OTF files into  pulsemeter/fonts/  and they will be registered
@@ -1252,6 +1268,7 @@ class SettingsWindow:
         self._app      = app
         self._manager  = app.manager
         self._max_duty = app._max_duty
+        self._firmware_version_text = "Not connected"
 
         parent.update_idletasks()
         parent_x = parent.winfo_x()
@@ -1259,7 +1276,7 @@ class SettingsWindow:
 
         win = tk.Toplevel(parent)
         win.title("Settings")
-        win.geometry(f"420x500+{parent_x}+{parent_y}")
+        win.geometry(f"420x530+{parent_x}+{parent_y}")
         win.resizable(False, False)
         win.configure(bg=THEME['bg'])
         _apply_window_icon(win)
@@ -1274,13 +1291,6 @@ class SettingsWindow:
         hdr.pack_propagate(False)
         tk.Label(hdr, text="Settings", bg=THEME['surface'],
                  fg=THEME['text'], font=FONT['title']).pack(side='left', padx=16, pady=10)
-
-        # --- Footer ---
-        footer = tk.Frame(win, bg=THEME['surface'])
-        footer.pack(fill='x', side='bottom')
-        _HoverButton(footer, text="Close", bg=THEME['card'], hover_bg=THEME['border'],
-                     fg=THEME['text'], font=FONT['btn'], relief='flat', cursor='hand2',
-                     padx=20, pady=6, command=self._on_close).pack(side='right', padx=16, pady=12)
 
         # --- Body ---
         body = tk.Frame(win, bg=THEME['bg'], padx=20, pady=12)
@@ -1453,7 +1463,22 @@ class SettingsWindow:
             else:
                 self._spin2, self._btn2_r, self._btn2_w = spin, btn_r, btn_w
 
+        # -- Separator --
+        tk.Frame(body, bg=THEME['border'], height=1).grid(
+            row=12, column=0, columnspan=4, sticky='ew', pady=(10, 12))
+
+        version_row = tk.Frame(body, bg=THEME['bg'])
+        version_row.grid(row=13, column=0, columnspan=4, sticky='ew')
+        version_row.grid_columnconfigure(0, weight=1)
+
+        self._version_info_value = tk.Label(
+            version_row, text="", bg=THEME['bg'],
+            fg=THEME['subtext'], font=FONT['small'], anchor='center',
+            justify='center')
+        self._version_info_value.grid(row=0, column=0, sticky='ew')
+
         body.grid_columnconfigure(1, weight=1)
+        self.refresh_version_info()
 
     # ------------------------------------------------------------------
     # Public refresh methods called by PulseMeterApp
@@ -1477,6 +1502,35 @@ class SettingsWindow:
     def refresh_ip_list(self, ips: list):
         """Update the IP combo when mDNS discovery changes."""
         self._ip_combo['values'] = ips
+
+    def refresh_version_info(self):
+        """Refresh the version line, reading firmware version when connected."""
+        if not self._manager.is_running:
+            self._firmware_version_text = "Not connected"
+            self._version_info_value.config(
+                text=f"Version Info: Desktop App {APP_VERSION}; Firmware {self._firmware_version_text}")
+            return
+
+        self._version_info_value.config(
+            text=f"Version Info: Desktop App {APP_VERSION}; Firmware Reading...")
+
+        def do():
+            value = self._manager.sender.read_param(
+                Protocol.PARAM_FIRMWARE_VERSION, timeout=1.0)
+            text = decode_packed_version(value) if value is not None else "Read failed"
+            print("Firmware version:", text)
+
+            def done():
+                self._firmware_version_text = text
+                self._version_info_value.config(
+                    text=f"Version Info: Desktop App {APP_VERSION}; Firmware {text}")
+
+            try:
+                self.win.after(0, done)
+            except tk.TclError:
+                pass
+
+        threading.Thread(target=do, daemon=True, name="ReadFirmwareVersion").start()
 
     # ------------------------------------------------------------------
     # Internal handlers
@@ -2072,6 +2126,7 @@ class PulseMeterApp:
         if self._settings_win is not None:
             try:
                 self._settings_win.refresh_connect_btn()
+                self._settings_win.refresh_version_info()
             except tk.TclError:
                 self._settings_win = None
 
