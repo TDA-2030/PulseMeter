@@ -5,12 +5,14 @@
 #include "esp_log.h"
 #include "meter_server.h"
 #include "meter_dial.h"
+#include "led.h"
 #include "firmware_version.h"
 #include "setting.h"
 
 static const char *TAG = "MeterServer";
 
 extern MeterDial meters[];
+extern led_handle_t meter_leds[];
 extern Setting g_settings;
 
 MeterServer::MeterServer()
@@ -18,6 +20,8 @@ MeterServer::MeterServer()
 {
     meter_value_[0] = 0;
     meter_value_[1] = 0;
+    meter_led_rgb_[0] = 0x00FFFFFF;
+    meter_led_rgb_[1] = 0x00FFFFFF;
 }
 
 bool MeterServer::startServer()
@@ -255,6 +259,12 @@ void MeterServer::handleReadReq(uint8_t seq, const uint8_t *payload, uint16_t le
     case PARAM_MODE:
         value = g_settings.mode;
         break;
+    case PARAM_METER1_RGB:
+        value = meter_led_rgb_[0];
+        break;
+    case PARAM_METER2_RGB:
+        value = meter_led_rgb_[1];
+        break;
     case PARAM_FIRMWARE_VERSION:
         value = FIRMWARE_VERSION_U32;
         break;
@@ -308,6 +318,21 @@ void MeterServer::handleWriteReq(uint8_t seq, const uint8_t *payload, uint16_t l
         g_settings.mode = (uint8_t)value;
         g_settings.save();
         break;
+    case PARAM_METER1_RGB:
+    case PARAM_METER2_RGB: {
+        const uint32_t meter_idx = (param_id == PARAM_METER1_RGB) ? 0 : 1;
+        const uint32_t red   = (value >> 16) & 0xFF;
+        const uint32_t green = (value >> 8) & 0xFF;
+        const uint32_t blue  = value & 0xFF;
+
+        if (led_set_pixel(meter_leds[meter_idx], red, green, blue) != ESP_OK
+            || led_refresh(meter_leds[meter_idx]) != ESP_OK) {
+            status = PROTO_STATUS_ERR;
+        } else {
+            meter_led_rgb_[meter_idx] = value & 0x00FFFFFF;
+        }
+        break;
+    }
     case PARAM_FIRMWARE_VERSION:
     case PARAM_METER1_VALUE:
     case PARAM_METER2_VALUE:

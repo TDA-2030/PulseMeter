@@ -37,4 +37,6 @@ private:
 
     // Last-known meter values, returned for PARAM_METERn_VALUE reads
     uint8_t meter_value_[2];
+    // Last-known LED colors, packed as 0x00RRGGBB for PARAM_METERn_RGB reads.
+    uint32_t meter_led_rgb_[2];
 };

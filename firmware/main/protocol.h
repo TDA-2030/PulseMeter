@@ -21,6 +21,8 @@
 #define PARAM_METER1_MAX_DUTY  0x0001  // uint32, rw — PWM duty ceiling for meter 1
 #define PARAM_METER2_MAX_DUTY  0x0002  // uint32, rw — PWM duty ceiling for meter 2
 #define PARAM_MODE             0x0003  // uint8,  rw — persisted in NVS
+#define PARAM_METER1_RGB       0x0020  // uint32, rw — packed LED color 0x00RRGGBB for meter 1
+#define PARAM_METER2_RGB       0x0021  // uint32, rw — packed LED color 0x00RRGGBB for meter 2
 #define PARAM_METER1_VALUE     0x0010  // uint8,  ro — current percent 0-100
 #define PARAM_METER2_VALUE     0x0011  // uint8,  ro — current percent 0-100
 

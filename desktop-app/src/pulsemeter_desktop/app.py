@@ -1,5 +1,5 @@
 import tkinter as tk
-from tkinter import messagebox, ttk
+from tkinter import colorchooser, messagebox, ttk
 import sys
 import time
 import os
@@ -289,6 +289,8 @@ class Protocol:
     PARAM_METER2_MAX_DUTY = 0x0002
     PARAM_MODE            = 0x0003
     PARAM_FIRMWARE_VERSION = 0x0004  # read-only, packed as 0x00MMmmpp
+    PARAM_METER1_RGB      = 0x0020
+    PARAM_METER2_RGB      = 0x0021
     PARAM_METER1_VALUE    = 0x0010  # read-only
     PARAM_METER2_VALUE    = 0x0011  # read-only
 
@@ -500,6 +502,25 @@ class DataSender:
         except Exception as e:
             print(f"[TCP] write_param parse error: {e}")
             return False
+
+    def write_meter_led(self, meter_idx: int, red: int, green: int, blue: int,
+                        timeout: float = 2.0) -> bool:
+        """Write one meter LED color as packed 0x00RRGGBB via WRITE_REQ."""
+        if meter_idx not in (1, 2):
+            raise ValueError(f"Invalid meter_idx: {meter_idx}")
+        param = Protocol.PARAM_METER1_RGB if meter_idx == 1 else Protocol.PARAM_METER2_RGB
+        value = ((int(red) & 0xFF) << 16) | ((int(green) & 0xFF) << 8) | (int(blue) & 0xFF)
+        return self.write_param(param, value, timeout=timeout)
+
+    def read_meter_led(self, meter_idx: int, timeout: float = 2.0):
+        """Read one meter LED color, returning (r, g, b) or None on failure."""
+        if meter_idx not in (1, 2):
+            raise ValueError(f"Invalid meter_idx: {meter_idx}")
+        param = Protocol.PARAM_METER1_RGB if meter_idx == 1 else Protocol.PARAM_METER2_RGB
+        value = self.read_param(param, timeout=timeout)
+        if value is None:
+            return None
+        return ((value >> 16) & 0xFF, (value >> 8) & 0xFF, value & 0xFF)
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -1257,9 +1278,11 @@ class _ProgressBar(tk.Canvas):
 
 class SettingsWindow:
     """
-    Modal settings popup with three sections:
+    Modal settings popup with four sections:
       CONNECTION  — IP combo, mDNS scan, connect/disconnect
+      AUDIO VU    — audio controls
       CALIBRATION — per-meter max_duty read/write
+      LIGHTS      — per-meter LED colour read/write
 
     Holds a reference to PulseMeterApp for bidirectional state sync.
     """
@@ -1269,6 +1292,8 @@ class SettingsWindow:
         self._manager  = app.manager
         self._max_duty = app._max_duty
         self._firmware_version_text = "Not connected"
+        self._led1_rgb = (255, 255, 255)
+        self._led2_rgb = (255, 255, 255)
 
         parent.update_idletasks()
         parent_x = parent.winfo_x()
@@ -1276,7 +1301,7 @@ class SettingsWindow:
 
         win = tk.Toplevel(parent)
         win.title("Settings")
-        win.geometry(f"420x530+{parent_x}+{parent_y}")
+        win.geometry(f"420x620+{parent_x}+{parent_y}")
         win.resizable(False, False)
         win.configure(bg=THEME['bg'])
         _apply_window_icon(win)
@@ -1465,10 +1490,46 @@ class SettingsWindow:
 
         # -- Separator --
         tk.Frame(body, bg=THEME['border'], height=1).grid(
-            row=12, column=0, columnspan=4, sticky='ew', pady=(10, 12))
+            row=12, column=0, columnspan=4, sticky='ew', pady=(10, 10))
+
+        # -- Section: LIGHTS --
+        tk.Label(body, text="LIGHTS", bg=THEME['bg'],
+                 fg=THEME['yellow'], font=FONT['section']).grid(
+                     row=13, column=0, columnspan=4, sticky='w', pady=(0, 4))
+
+        for idx, name in enumerate(["Meter 1  LED", "Meter 2  LED"]):
+            row = 14 + idx
+            tk.Label(body, text=name, bg=THEME['bg'],
+                     fg=THEME['subtext'], font=FONT['small']).grid(
+                         row=row, column=0, sticky='w', pady=6)
+
+            swatch = tk.Canvas(
+                body, width=26, height=26, bg=THEME['bg'],
+                highlightthickness=0, cursor='hand2'
+            )
+            swatch.grid(row=row, column=1, sticky='w', padx=(8, 4), pady=4)
+            oval = swatch.create_oval(
+                3, 3, 23, 23, fill='#ffffff', outline=THEME['border'], width=2
+            )
+            swatch.bind('<Button-1>', lambda _event, i=idx + 1: self._choose_led_color(i))
+
+            value = tk.Label(
+                body, text="Click to set", bg=THEME['bg'],
+                fg=THEME['text'], font=FONT['small'], anchor='w'
+            )
+            value.grid(row=row, column=2, columnspan=2, sticky='w', pady=6)
+
+            if idx == 0:
+                self._led1_canvas, self._led1_dot, self._led1_value = swatch, oval, value
+            else:
+                self._led2_canvas, self._led2_dot, self._led2_value = swatch, oval, value
+
+        # -- Separator --
+        tk.Frame(body, bg=THEME['border'], height=1).grid(
+            row=16, column=0, columnspan=4, sticky='ew', pady=(10, 12))
 
         version_row = tk.Frame(body, bg=THEME['bg'])
-        version_row.grid(row=13, column=0, columnspan=4, sticky='ew')
+        version_row.grid(row=17, column=0, columnspan=4, sticky='ew')
         version_row.grid_columnconfigure(0, weight=1)
 
         self._version_info_value = tk.Label(
@@ -1479,6 +1540,9 @@ class SettingsWindow:
 
         body.grid_columnconfigure(1, weight=1)
         self.refresh_version_info()
+        self._set_led_swatch(1, self._led1_rgb)
+        self._set_led_swatch(2, self._led2_rgb)
+        self._refresh_led_colors()
 
     # ------------------------------------------------------------------
     # Public refresh methods called by PulseMeterApp
@@ -1486,7 +1550,8 @@ class SettingsWindow:
 
     def refresh_connect_btn(self):
         """Sync the connect/disconnect button text and colour to manager state."""
-        if self._manager.is_running:
+        connected = self._manager.is_running
+        if connected:
             self._conn_btn._normal_bg = THEME['red']
             self._conn_btn._hover_bg  = '#ffa0b0'
             self._conn_btn.config(text="■ Discon.", bg=THEME['red'], fg=THEME['bg'])
@@ -1498,6 +1563,10 @@ class SettingsWindow:
         # (_calib_btn may not exist yet during __init__ construction)
         if hasattr(self, '_calib_btn'):
             self._refresh_calib_btn()
+        if hasattr(self, '_led1_canvas'):
+            self._refresh_led_controls(connected)
+            if connected:
+                self._refresh_led_colors()
 
     def refresh_ip_list(self, ips: list):
         """Update the IP combo when mDNS discovery changes."""
@@ -1531,6 +1600,66 @@ class SettingsWindow:
                 pass
 
         threading.Thread(target=do, daemon=True, name="ReadFirmwareVersion").start()
+
+    @staticmethod
+    def _rgb_to_hex(rgb: tuple[int, int, int]) -> str:
+        return "#{:02x}{:02x}{:02x}".format(*rgb)
+
+    def _set_led_swatch(self, meter_idx: int, rgb: tuple[int, int, int]):
+        if meter_idx == 1:
+            self._led1_rgb = rgb
+            canvas, item, label = self._led1_canvas, self._led1_dot, self._led1_value
+        else:
+            self._led2_rgb = rgb
+            canvas, item, label = self._led2_canvas, self._led2_dot, self._led2_value
+        canvas.itemconfig(item, fill=self._rgb_to_hex(rgb))
+        label.config(text=f"RGB {rgb[0]}, {rgb[1]}, {rgb[2]}")
+
+    def _refresh_led_colors(self):
+        if not self._manager.is_running:
+            return
+        self._led1_value.config(text="Reading...")
+        self._led2_value.config(text="Reading...")
+
+        def do():
+            rgb1 = self._manager.sender.read_meter_led(1, timeout=1.0)
+            rgb2 = self._manager.sender.read_meter_led(2, timeout=1.0)
+
+            def done():
+                if rgb1 is not None:
+                    self._set_led_swatch(1, rgb1)
+                    print(f"[APP] meter1 led = {rgb1}")
+                else:
+                    self._led1_value.config(text="Read failed")
+                    print("[APP] meter1 led read failed")
+                if rgb2 is not None:
+                    self._set_led_swatch(2, rgb2)
+                    print(f"[APP] meter2 led = {rgb2}")
+                else:
+                    self._led2_value.config(text="Read failed")
+                    print("[APP] meter2 led read failed")
+
+            try:
+                self.win.after(0, done)
+            except tk.TclError:
+                pass
+
+        threading.Thread(target=do, daemon=True, name="ReadMeterLedColors").start()
+
+    def _refresh_led_controls(self, connected: bool):
+        cursor = 'hand2' if connected else 'arrow'
+        text_color = THEME['text'] if connected else THEME['border']
+        ring_color = THEME['border'] if connected else THEME['card']
+        for canvas, item, label in [
+            (self._led1_canvas, self._led1_dot, self._led1_value),
+            (self._led2_canvas, self._led2_dot, self._led2_value),
+        ]:
+            canvas.config(cursor=cursor)
+            canvas.itemconfig(item, outline=ring_color)
+            if not connected:
+                label.config(text="Connect to edit", fg=text_color)
+            else:
+                label.config(fg=text_color)
 
     # ------------------------------------------------------------------
     # Internal handlers
@@ -1625,6 +1754,42 @@ class SettingsWindow:
         self._manager.setting.save(self._manager.setting.save_filename)
         self._app._settings_win = None
         self.win.destroy()
+
+    def _choose_led_color(self, meter_idx: int):
+        if not self._manager.is_running:
+            return
+        current = self._led1_rgb if meter_idx == 1 else self._led2_rgb
+        _, hex_color = colorchooser.askcolor(
+            color=self._rgb_to_hex(current),
+            parent=self.win,
+            title=f"Meter {meter_idx} LED Color",
+        )
+        if not hex_color:
+            return
+
+        rgb = tuple(int(hex_color[i:i+2], 16) for i in (1, 3, 5))
+        self._set_led_swatch(meter_idx, rgb)
+
+        value_label = self._led1_value if meter_idx == 1 else self._led2_value
+        value_label.config(text="Writing...")
+
+        def do():
+            ok = self._manager.sender.write_meter_led(meter_idx, *rgb, timeout=1.0)
+
+            def done():
+                if ok:
+                    self._set_led_swatch(meter_idx, rgb)
+                    print(f"[APP] meter{meter_idx} led write ok: {rgb}")
+                else:
+                    value_label.config(text="Write failed")
+                    print(f"[APP] meter{meter_idx} led write FAILED")
+
+            try:
+                self.win.after(0, done)
+            except tk.TclError:
+                pass
+
+        threading.Thread(target=do, daemon=True, name=f"WriteMeter{meter_idx}Led").start()
 
     def _read_duty(self, meter_idx: int, spin: ttk.Spinbox):
         """Read max_duty from device and populate the spinbox."""

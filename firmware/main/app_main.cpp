@@ -19,6 +19,7 @@ MeterDial meters[] = {
     MeterDial("Meter1"),
     MeterDial("Meter2"),
 };
+led_handle_t meter_leds[] = { nullptr, nullptr };
 
 MeterServer server;
 
@@ -37,11 +38,12 @@ extern "C" void app_main()
     g_settings.load();
     vTaskDelay(pdMS_TO_TICKS(100));
     board_init();
-    led_init(BOARD_IO_LED_STRIP, 16);
-    led_set_pixel(0, 255, 255, 255);
-    led_set_pixel(1, 255, 255, 255);
-    led_set_pixel(2, 255, 255, 255);
-    led_refresh();
+    ESP_ERROR_CHECK(led_create(BOARD_IO_LED_STRIP1, 16, 0, &meter_leds[0]));
+    ESP_ERROR_CHECK(led_create(BOARD_IO_LED_STRIP2, 16, 0, &meter_leds[1]));
+    ESP_ERROR_CHECK(led_set_pixel(meter_leds[0], 255, 255, 255));
+    ESP_ERROR_CHECK(led_set_pixel(meter_leds[1], 255, 255, 255));
+    ESP_ERROR_CHECK(led_refresh(meter_leds[0]));
+    ESP_ERROR_CHECK(led_refresh(meter_leds[1]));
 
     /** Determine whether to restore the settings by reading the restart count */
     int restart_cnt = restart_count_get();

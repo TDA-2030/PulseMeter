@@ -44,9 +44,14 @@ idf.py build flash monitor
 |---|---|
 | 仪表 1 PWM | 5 |
 | 仪表 2 PWM | 6 |
-| LED 红 | 10 |
-| LED 绿 | 1 |
+| 灯带 1 数据 | 4 |
+| 灯带 2 数据 | 7 |
 | I2C SDA / SCL | 2 / 3 |
+
+说明：
+
+- 两路 RGB 分别对应两条独立 WS2812 灯带
+- 当前固件默认控制每条灯带的第 1 个灯珠
 
 
 
@@ -78,7 +83,7 @@ magic[2]  type[1]  seq[1]  len[2]  payload[len]  crc8[1]
 | `0x01` | Host → Device | `MSG_STREAM`，推送两路表针数值，不返回响应 |
 | `0x02` | Host → Device | `MSG_READ_REQ`，读取设备参数 |
 | `0x03` | Device → Host | `MSG_READ_RSP`，返回参数值 |
-| `0x04` | Host → Device | `MSG_WRITE_REQ`，写入设备参数 |
+| `0x04` | Host → Device | `MSG_WRITE_REQ`，写入设备参数，包括两路 LED RGB |
 | `0x05` | Device → Host | `MSG_WRITE_RSP`，返回写入结果 |
 
 ### `MSG_STREAM` 实时表针数据
@@ -130,6 +135,18 @@ param_id[2]  status[1]  value[4]
 param_id[2]  value[4]
 ```
 
+两路 LED 颜色通过独立参数写入，`value` 采用 `0x00RRGGBB` 打包格式。
+
+- `PARAM_METER1_RGB` 控制 GPIO `4` 上的灯带 1
+- `PARAM_METER2_RGB` 控制 GPIO `7` 上的灯带 2
+
+示例：将第 1 路 LED 设置为橙色 `RGB(255, 128, 0)`：
+
+```text
+param_id = 0x0020
+value    = 0x00FF8000
+```
+
 写入响应负载：
 
 ```text
@@ -151,6 +168,7 @@ param_id[2]  status[1]
 | `PARAM_METER1_MAX_DUTY` | `0x0001` | `uint32` | 仪表 1 的 PWM 占空比上限，可读写 |
 | `PARAM_METER2_MAX_DUTY` | `0x0002` | `uint32` | 仪表 2 的 PWM 占空比上限，可读写 |
 | `PARAM_MODE` | `0x0003` | `uint8` | 设备模式，可读写 |
+| `PARAM_METER1_RGB` | `0x0020` | `uint32` | 仪表 1 LED 颜色，格式 `0x00RRGGBB`，可读写 |
+| `PARAM_METER2_RGB` | `0x0021` | `uint32` | 仪表 2 LED 颜色，格式 `0x00RRGGBB`，可读写 |
 | `PARAM_METER1_VALUE` | `0x0010` | `uint8` | 仪表 1 当前百分比，只读 |
 | `PARAM_METER2_VALUE` | `0x0011` | `uint8` | 仪表 2 当前百分比，只读 |
-

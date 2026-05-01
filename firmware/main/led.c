@@ -7,6 +7,7 @@
 
 #include <inttypes.h>
 #include <stdbool.h>
+#include <stdlib.h>
 
 #include "esp_log.h"
 #include "led_strip.h"
@@ -16,7 +17,13 @@
 #define LED_RMT_RES_HZ (10 * 1000 * 1000)
 
 static const char *TAG = "led";
-static led_strip_handle_t s_strip;
+
+struct led {
+    int gpio;
+    uint32_t max_leds;
+    led_strip_handle_t strip;
+    uint32_t pixel_index;
+};
 
 static void led_hsv_to_rgb(uint32_t hue, uint32_t saturation, uint32_t value, uint32_t *red, uint32_t *green, uint32_t *blue)
 {
@@ -90,16 +97,18 @@ static void led_hsv_to_rgb(uint32_t hue, uint32_t saturation, uint32_t value, ui
     }
 }
 
-esp_err_t led_init(int gpio, uint32_t max_leds)
+esp_err_t led_create(int gpio, uint32_t max_leds, uint32_t pixel_index, led_handle_t *out_led)
 {
-    if (max_leds == 0) {
-        ESP_LOGE(TAG, "LED init failed: max_leds must be greater than zero");
+    if (!out_led || max_leds == 0 || pixel_index >= max_leds) {
+        ESP_LOGE(TAG, "LED create failed: invalid arguments");
         return ESP_ERR_INVALID_ARG;
     }
+    *out_led = NULL;
 
-    if (s_strip) {
-        ESP_LOGW(TAG, "LED strip already initialized");
-        return ESP_OK;
+    led_handle_t led = calloc(1, sizeof(*led));
+    if (!led) {
+        ESP_LOGE(TAG, "LED create failed: handle allocation failed");
+        return ESP_ERR_NO_MEM;
     }
 
     led_strip_config_t strip_config = {
@@ -120,56 +129,69 @@ esp_err_t led_init(int gpio, uint32_t max_leds)
         },
     };
 
-    // Create the RMT-backed LED strip device before exposing color operations.
-    esp_err_t err = led_strip_new_rmt_device(&strip_config, &rmt_config, &s_strip);
+    esp_err_t err = led_strip_new_rmt_device(&strip_config, &rmt_config, &led->strip);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "LED strip init failed: %s", esp_err_to_name(err));
-        s_strip = NULL;
+        ESP_LOGE(TAG, "LED create failed: %s", esp_err_to_name(err));
+        free(led);
         return err;
     }
 
-    return led_clear();
-}
+    led->gpio = gpio;
+    led->max_leds = max_leds;
+    led->pixel_index = pixel_index;
 
-esp_err_t led_deinit(void)
-{
-    if (!s_strip) {
-        return ESP_OK;
-    }
-
-    led_strip_handle_t strip = s_strip;
-
-    // Clear the LEDs before deleting the strip so the physical state is predictable.
-    esp_err_t err = led_strip_clear(strip);
+    err = led_strip_clear(led->strip);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "LED strip clear before deinit failed: %s", esp_err_to_name(err));
-    }
-
-    err = led_strip_del(strip);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "LED strip deinit failed: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "LED clear after create failed: %s", esp_err_to_name(err));
+        led_strip_del(led->strip);
+        free(led);
         return err;
     }
-
-    s_strip = NULL;
+    *out_led = led;
     return ESP_OK;
 }
 
-esp_err_t led_set_pixel(uint32_t index, uint32_t red, uint32_t green, uint32_t blue)
+esp_err_t led_destroy(led_handle_t led)
 {
-    if (!s_strip) {
-        ESP_LOGE(TAG, "LED set_pixel failed: strip is not initialized");
+    if (!led) {
+        return ESP_OK;
+    }
+
+    esp_err_t err = ESP_OK;
+    if (led->strip) {
+        err = led_strip_clear(led->strip);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "LED strip clear before destroy failed: %s", esp_err_to_name(err));
+        }
+
+        err = led_strip_del(led->strip);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "LED strip destroy failed: %s", esp_err_to_name(err));
+            free(led);
+            return err;
+        }
+    }
+
+    free(led);
+    return ESP_OK;
+}
+
+esp_err_t led_set_pixel(led_handle_t led, uint32_t red, uint32_t green, uint32_t blue)
+{
+    if (!led || !led->strip) {
+        ESP_LOGE(TAG, "LED set_pixel failed: invalid led handle");
         return ESP_ERR_INVALID_STATE;
     }
 
-    esp_err_t err = led_strip_set_pixel(s_strip, index, red, green, blue);
+    esp_err_t err = led_strip_set_pixel(led->strip, led->pixel_index, red, green, blue);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "LED set_pixel failed at index %" PRIu32 ": %s", index, esp_err_to_name(err));
+        ESP_LOGE(TAG, "LED set_pixel failed at index %" PRIu32 ": %s",
+                 led->pixel_index, esp_err_to_name(err));
     }
     return err;
 }
 
-esp_err_t led_set_pixel_hsv(uint32_t index, uint32_t hue, uint32_t saturation, uint32_t value)
+esp_err_t led_set_pixel_hsv(led_handle_t led, uint32_t hue, uint32_t saturation, uint32_t value)
 {
     if (saturation > 255 || value > 255) {
         ESP_LOGE(TAG, "LED set_pixel_hsv failed: saturation and value must be in range 0-255");
@@ -182,33 +204,34 @@ esp_err_t led_set_pixel_hsv(uint32_t index, uint32_t hue, uint32_t saturation, u
 
     // Convert HSV to RGB because the led_strip driver accepts RGB components.
     led_hsv_to_rgb(hue, saturation, value, &red, &green, &blue);
-    return led_set_pixel(index, red, green, blue);
+    return led_set_pixel(led, red, green, blue);
 }
 
-esp_err_t led_refresh(void)
+esp_err_t led_refresh(led_handle_t led)
 {
-    if (!s_strip) {
-        ESP_LOGE(TAG, "LED refresh failed: strip is not initialized");
+    if (!led || !led->strip) {
+        ESP_LOGE(TAG, "LED refresh failed: invalid led handle");
         return ESP_ERR_INVALID_STATE;
     }
 
-    esp_err_t err = led_strip_refresh(s_strip);
+    esp_err_t err = led_strip_refresh(led->strip);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "LED refresh failed: %s", esp_err_to_name(err));
     }
     return err;
 }
 
-esp_err_t led_clear(void)
+esp_err_t led_clear(led_handle_t led)
 {
-    if (!s_strip) {
-        ESP_LOGE(TAG, "LED clear failed: strip is not initialized");
+    if (!led || !led->strip) {
+        ESP_LOGE(TAG, "LED clear failed: invalid led handle");
         return ESP_ERR_INVALID_STATE;
     }
 
-    esp_err_t err = led_strip_clear(s_strip);
+    esp_err_t err = led_strip_set_pixel(led->strip, led->pixel_index, 0, 0, 0);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "LED clear failed: %s", esp_err_to_name(err));
+        return err;
     }
-    return err;
+    return led_refresh(led);
 }
