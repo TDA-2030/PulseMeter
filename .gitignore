@@ -1,4 +1,5 @@
 .vscode
+.codex
 CLAUDE.md
 uv.lock
 meter_dial_generated.png

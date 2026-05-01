@@ -7,6 +7,7 @@
 #include "helper.h"
 #include "setting.h"
 #include "wifi.h"
+#include "led.h"
 #include "board.h"
 #include "firmware_version.h"
 #include "meter_dial.h"
@@ -36,6 +37,11 @@ extern "C" void app_main()
     g_settings.load();
     vTaskDelay(pdMS_TO_TICKS(100));
     board_init();
+    led_init(BOARD_IO_LED_STRIP, 16);
+    led_set_pixel(0, 255, 255, 255);
+    led_set_pixel(1, 255, 255, 255);
+    led_set_pixel(2, 255, 255, 255);
+    led_refresh();
 
     /** Determine whether to restore the settings by reading the restart count */
     int restart_cnt = restart_count_get();
