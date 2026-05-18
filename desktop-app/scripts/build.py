@@ -49,6 +49,10 @@ def _data_args() -> List[str]:
     if fonts.is_dir() and any(fonts.glob("*.[tToO][tTpP][fF]")):
         items += ["--add-data", f"{fonts}{sep}fonts"]
 
+    libre_hw_dir = PACKAGE_ROOT / "vendor" / "librehardwaremonitor"
+    if libre_hw_dir.is_dir():
+        items += ["--add-data", f"{libre_hw_dir}{sep}vendor/librehardwaremonitor"]
+
     return items
 
 
@@ -74,6 +78,8 @@ def _hidden_import_args() -> List[str]:
 
 def _collect_args() -> List[str]:
     packages = ["soundcard", "zeroconf"]
+    if SYSTEM == "Windows":
+        packages += ["pythonnet", "clr_loader"]
     return [arg for package in packages for arg in ("--collect-submodules", package)]
 
 

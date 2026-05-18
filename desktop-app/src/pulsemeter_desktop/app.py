@@ -24,8 +24,18 @@ PACKAGE_ROOT = Path(__file__).resolve().parent
 if __package__ in (None, ""):
     sys.path.insert(0, str(PACKAGE_ROOT.parent))
     from pulsemeter_desktop.settings import APP_NAME, Setting, get_app_config_dir
+    from pulsemeter_desktop.hardware_monitor import (
+        HARDWARE_METRIC_KEYS,
+        HARDWARE_METRIC_LABELS,
+        LibreHardwareMonitorProvider,
+    )
 else:
     from .settings import APP_NAME, Setting, get_app_config_dir
+    from .hardware_monitor import (
+        HARDWARE_METRIC_KEYS,
+        HARDWARE_METRIC_LABELS,
+        LibreHardwareMonitorProvider,
+    )
 
 from zeroconf import ServiceBrowser, ServiceStateChange, Zeroconf
 
@@ -700,7 +710,7 @@ class SubnetDeviceScanner:
 
 # Metric display labels — BMP-only Unicode symbols render on all platforms and fonts.
 # Raw keys are used everywhere internally; labels appear only in the UI comboboxes.
-METRIC_LABELS = {
+BASE_METRIC_LABELS = {
     'cpu':           '⚡ CPU',
     'memory':        '🧠 Memory',
     'disk_io_read':  '📤 Disk Read',
@@ -711,6 +721,10 @@ METRIC_LABELS = {
     'time_hour':     '🕐 Hour',
     'time_minute':   '⏱ Minute',
     'time_second':   '⏲ Second',
+}
+METRIC_LABELS = {
+    **BASE_METRIC_LABELS,
+    **HARDWARE_METRIC_LABELS,
 }
 METRIC_KEYS = {v: k for k, v in METRIC_LABELS.items()}
 
@@ -744,6 +758,8 @@ class DataCollector:
         self._audio_stop = threading.Event()
         self._audio_thread: threading.Thread | None = None
         self._audio_device_poll_s: float = 1.0
+        self._hardware_monitor = LibreHardwareMonitorProvider()
+        self._hardware_metric_keys = set(HARDWARE_METRIC_KEYS)
         # Cache of the last non-audio data frame.  Written by _run() at 0.5 s;
         # read by _audio_loop() so it can assemble a complete dict at 50 ms rate.
         # Dict reference replacement is atomic under the GIL, so no extra lock needed.
@@ -751,7 +767,18 @@ class DataCollector:
 
     def get_available_metrics(self):
         # Returns display labels (with icons); use METRIC_KEYS to convert back to raw keys.
-        return list(METRIC_LABELS.values())
+        return [
+            METRIC_LABELS[key]
+            for key in (
+                *BASE_METRIC_LABELS,
+                *self._hardware_monitor.get_available_metric_keys(),
+            )
+        ]
+
+    def get_metric_issue(self, metric_key: str, value) -> str | None:
+        return self._hardware_monitor.get_metric_issue(
+            metric_key, has_value=value is not None
+        )
 
     def set_audio_gain(self, gain: float):
         try:
@@ -1025,6 +1052,8 @@ class DataCollector:
                     data["time_minute"] = now.tm_min
                 if "time_second" in metrics:
                     data["time_second"] = now.tm_sec
+            if any(m in self._hardware_metric_keys for m in metrics):
+                data.update(self._hardware_monitor.read(metrics))
             if "audio" in metrics:
                 # When audio is active the _audio_loop drives the callback at
                 # _AUDIO_CHUNK_S rate.  Here we only refresh the non-audio cache
@@ -1071,6 +1100,46 @@ class MeterManager:
                 return max(0, min(100, int(round(pct))))
             except (TypeError, ValueError, ZeroDivisionError):
                 return 0
+        if metric in ("cpu_temp", "gpu_temp", "storage_temp", "motherboard_temp"):
+            try:
+                return max(0, min(100, int(round(float(v)))))
+            except (TypeError, ValueError):
+                return 0
+        if metric == "cpu_power":
+            try:
+                return max(0, min(100, int(round(float(v) / 2.0))))
+            except (TypeError, ValueError):
+                return 0
+        if metric == "gpu_power":
+            try:
+                return max(0, min(100, int(round(float(v) / 3.5))))
+            except (TypeError, ValueError):
+                return 0
+        if metric == "cpu_clock":
+            try:
+                return max(0, min(100, int(round(float(v) / 60.0))))
+            except (TypeError, ValueError):
+                return 0
+        if metric == "gpu_core_clock":
+            try:
+                return max(0, min(100, int(round(float(v) / 30.0))))
+            except (TypeError, ValueError):
+                return 0
+        if metric == "gpu_memory_clock":
+            try:
+                return max(0, min(100, int(round(float(v) / 120.0))))
+            except (TypeError, ValueError):
+                return 0
+        if metric == "cpu_voltage":
+            try:
+                return max(0, min(100, int(round(float(v) / 0.015))))
+            except (TypeError, ValueError):
+                return 0
+        if metric == "fan_speed":
+            try:
+                return max(0, min(100, int(round(float(v) / 40.0))))
+            except (TypeError, ValueError):
+                return 0
         if metric == "time_hour":
             try:
                 return int(min(max(float(v), 0.0) / 23.0 * 100.0, 100.0))
@@ -1093,21 +1162,20 @@ class MeterManager:
             metrics = self.collector.metrics
             if len(metrics) < 2:
                 return
-            # Use .get() so a mid-switch frame missing the new key is treated as 0.
-            data1 = data.get(metrics[0], 0)
-            data2 = data.get(metrics[1], 0)
+            raw1 = data.get(metrics[0])
+            raw2 = data.get(metrics[1])
             if self._calibrating:
                 # Send full-scale values so the needle visually reaches max_duty
                 ok = self.sender.send_data(100, 100)
             else:
-                pct1 = self._to_pct(metrics[0], data1)
-                pct2 = self._to_pct(metrics[1], data2)
+                pct1 = self._to_pct(metrics[0], 0 if raw1 is None else raw1)
+                pct2 = self._to_pct(metrics[1], 0 if raw2 is None else raw2)
                 # print(f"[CPU] Sending data: {pct1}, {pct2}")
                 ok = self.sender.send_data(pct1, pct2)
             if not ok:
                 return
             if self.extra_display_callback:
-                self.extra_display_callback(data1, data2)
+                self.extra_display_callback(raw1, raw2)
         except Exception as e:
             print(f"[CPU] Loop error: {e}")
             traceback.print_exc()
@@ -2253,6 +2321,54 @@ class PulseMeterApp:
                 return f"{db:.1f}", "dB", max(0.0, min(100.0, pct))
             except (TypeError, ValueError, ZeroDivisionError):
                 return "-", "dB", 0.0
+        if metric in ("cpu_temp", "gpu_temp", "storage_temp", "motherboard_temp"):
+            try:
+                f = float(v)
+                return f"{f:.1f}", "°C", max(0.0, min(100.0, f))
+            except (TypeError, ValueError):
+                return "—", "°C", 0.0
+        if metric == "cpu_power":
+            try:
+                f = float(v)
+                return f"{f:.1f}", "W", max(0.0, min(100.0, f / 2.0))
+            except (TypeError, ValueError):
+                return "—", "W", 0.0
+        if metric == "gpu_power":
+            try:
+                f = float(v)
+                return f"{f:.1f}", "W", max(0.0, min(100.0, f / 3.5))
+            except (TypeError, ValueError):
+                return "—", "W", 0.0
+        if metric == "cpu_clock":
+            try:
+                f = float(v)
+                return f"{f:.0f}", "MHz", max(0.0, min(100.0, f / 60.0))
+            except (TypeError, ValueError):
+                return "—", "MHz", 0.0
+        if metric == "gpu_core_clock":
+            try:
+                f = float(v)
+                return f"{f:.0f}", "MHz", max(0.0, min(100.0, f / 30.0))
+            except (TypeError, ValueError):
+                return "—", "MHz", 0.0
+        if metric == "gpu_memory_clock":
+            try:
+                f = float(v)
+                return f"{f:.0f}", "MHz", max(0.0, min(100.0, f / 120.0))
+            except (TypeError, ValueError):
+                return "—", "MHz", 0.0
+        if metric == "cpu_voltage":
+            try:
+                f = float(v)
+                return f"{f:.3f}", "V", max(0.0, min(100.0, f / 0.015))
+            except (TypeError, ValueError):
+                return "—", "V", 0.0
+        if metric == "fan_speed":
+            try:
+                rpm = float(v)
+                return f"{rpm:.0f}", "RPM", max(0.0, min(100.0, rpm / 40.0))
+            except (TypeError, ValueError):
+                return "—", "RPM", 0.0
         try:
             f = float(v)
             return f"{f:.1f}", "%", f
@@ -2263,6 +2379,7 @@ class PulseMeterApp:
         """Collector thread callback — must marshal to the main thread."""
         def _update():
             metrics = self.manager.collector.metrics or ["", ""]
+            issues: list[str] = []
             for metric, val, lbl, unit_lbl, prog in [
                 (metrics[0] if len(metrics) > 0 else "", meter1, self._val1, self._unit1, self._prog1),
                 (metrics[1] if len(metrics) > 1 else "", meter2, self._val2, self._unit2, self._prog2),
@@ -2271,6 +2388,16 @@ class PulseMeterApp:
                 lbl.config(text=text)
                 unit_lbl.config(text=unit)
                 prog.set_value(pct)
+                issue = self.manager.collector.get_metric_issue(metric, val)
+                if issue:
+                    issues.append(issue)
+
+            if issues:
+                self._set_hint_status(issues[0], THEME['yellow'])
+            elif self.manager.is_running:
+                host = (self.manager.setting.systemsetting.server_ip or "").strip()
+                if host:
+                    self._set_hint_status(f"Connected: {host}", THEME['green'])
 
         self.root.after(0, _update)
 
